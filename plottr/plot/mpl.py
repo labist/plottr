@@ -727,7 +727,7 @@ class AutoPlot(_MPLPlotWidget):
             if self.plotDataType is PlotDataType.scatter1d:
                 fmt = 'o'
             else:
-                fmt = 'o-'
+                fmt = '-'
 
             ax.plot(x, deps[i], fmt, mfc='None', mew=1, lw=0.5, label=lbl)
             ax.set_xlabel(xname)
