@@ -149,7 +149,7 @@ def determinePlotDataType(data: DataDictBase) -> PlotDataType:
 
 # matplotlib tools and settings
 default_prop_cycle = rcParams['axes.prop_cycle']
-default_cmap = cm.get_cmap('magma')
+default_cmap = cm.get_cmap('viridis')
 symmetric_cmap = cm.get_cmap('bwr')
 
 
