@@ -14,30 +14,39 @@ are attributes of the dataset (incl., the `unit` and `axes` values). The meta
 data keys are given exactly like in the DataDict, i.e., incl the double
 underscore pre- and suffix.
 """
-
 import os
 import time
 from enum import Enum
-from typing import Any, Union
+from typing import Any, Union, Optional, Dict, Type, Collection
+from types import TracebackType
 
 import numpy as np
 import h5py
 
-from plottr import QtGui, Signal, Slot
+from plottr import QtGui, Signal, Slot, QtWidgets
 
 from ..node import (
     Node, NodeWidget, updateOption, updateGuiFromNode,
     emitGuiUpdate,
 )
 
-from .datadict import DataDict, is_meta_key
+from .datadict import DataDict, is_meta_key, DataDictBase
 
 __author__ = 'Wolfgang Pfaff'
 __license__ = 'MIT'
 
 DATAFILEXT = '.ddh5'
+TIMESTRFORMAT = "%Y-%m-%d %H:%M:%S"
 
-AppendMode = Enum('AppendMode', names='new all none')
+
+class AppendMode(Enum):
+    """How/Whether to append data to existing data."""
+    #: data that is additional compared to already existing data is appended
+    new = 0
+    #: all data is appended to existing data
+    all = 1
+    #: data is overwritten
+    none = 2
 
 
 def h5ify(obj: Any) -> Any:
@@ -50,10 +59,16 @@ def h5ify(obj: Any) -> Any:
     :param obj: input object
     :return: object, converted if necessary
     """
-    if type(obj) == list:
-        obj = np.array(obj)
+    if isinstance(obj, list):
+        all_string = True
+        for elt in obj:
+            if not isinstance(elt, str):
+                all_string = False
+                break
+        if not all_string:
+            obj = np.array(obj)
 
-    if type(obj) == np.ndarray and obj.dtype == np.dtype('<U1'):
+    if type(obj) == np.ndarray and obj.dtype.kind == 'U':
         return np.chararray.encode(obj, encoding='utf8')
 
     return obj
@@ -64,13 +79,13 @@ def deh5ify(obj: Any) -> Any:
     if type(obj) == bytes:
         return obj.decode()
 
-    if type(obj) == np.ndarray and obj.dtype == np.dtype('S1'):
+    if type(obj) == np.ndarray and obj.dtype.kind == 'S':
         return np.chararray.decode(obj)
 
     return obj
 
 
-def set_attr(h5obj: Any, name: str, val: Any):
+def set_attr(h5obj: Any, name: str, val: Any) -> None:
     """Set attribute `name` of object `h5obj` to `val`
 
     Use :func:`h5ify` to convert the object, then try to set the attribute
@@ -85,18 +100,18 @@ def set_attr(h5obj: Any, name: str, val: Any):
 
 
 def add_cur_time_attr(h5obj: Any, name: str = 'creation',
-                      prefix: str = '__', suffix: str = '__'):
+                      prefix: str = '__', suffix: str = '__') -> None:
     """Add current time information to the given HDF5 object."""
 
     t = time.localtime()
     tsec = time.mktime(t)
-    tstr = time.strftime("%Y-%m-%d %H:%M:%S", t)
+    tstr = time.strftime(TIMESTRFORMAT, t)
 
     set_attr(h5obj, prefix + name + '_time_sec' + suffix, tsec)
     set_attr(h5obj, prefix + name + '_time_str' + suffix, tstr)
 
 
-def init_file(filepath: str):
+def init_path(filepath: str) -> None:
     """Init a new file.
 
     create the folder structure, if necessary, and the file.
@@ -107,15 +122,16 @@ def init_file(filepath: str):
     if not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
 
-    if not os.path.exists(filepath):
-        with h5py.File(filepath, 'w', libver='latest') as _:
-            pass
+    # if not os.path.exists(filepath):
+    #     with h5py.File(filepath, 'w', libver='latest') as _:
+    #         pass
 
 
-def datadict_to_hdf5(datadict: DataDict, basepath: str,
+def datadict_to_hdf5(datadict: DataDict,
+                     basepath: str,
                      groupname: str = 'data',
                      append_mode: AppendMode = AppendMode.new,
-                     swmr_mode: bool = True):
+                     swmr_mode: bool = True) -> None:
     """Write a DataDict to DDH5
 
     Note: meta data is only written during initial writing of the dataset.
@@ -137,91 +153,133 @@ def datadict_to_hdf5(datadict: DataDict, basepath: str,
     if len(basepath) > len(DATAFILEXT) and \
             basepath[-len(DATAFILEXT):] == DATAFILEXT:
         filepath = basepath
-        basepath = basepath[:-len(DATAFILEXT)]
     else:
         filepath = basepath + DATAFILEXT
 
     if not os.path.exists(filepath):
-        init_file(filepath)
+        init_path(filepath)
 
-    with h5py.File(filepath, 'a', libver='latest') as f:
-        if append_mode == AppendMode.none and groupname in f:
-            del f[groupname]
-            f.flush()
-            grp = f.create_group(groupname)
-            add_cur_time_attr(grp)
+    if not os.path.exists(filepath):
+        append_mode = AppendMode.none
 
-        elif groupname not in f:
-            grp = f.create_group(groupname)
-            add_cur_time_attr(grp)
+    with h5py.File(filepath, mode='a', libver='latest') as f:
+        if append_mode is AppendMode.none:
+            init_file(f, groupname)
+        write_data_to_file(datadict, f, groupname, append_mode, swmr_mode)
 
-        else:
-            grp = f[groupname]
 
-        # if we want to use swmr, we need to make sure that we're not
-        # creating any more objects (see hdf5 docs).
-        allexist = True
-        for k, v in datadict.data_items():
-            if k not in grp:
-                allexist = False
+def init_file(f: h5py.File,
+              groupname: str = 'data') -> None:
 
-        # add top-level meta data.
-        if not allexist:
-            for k, v in datadict.meta_items(clean_keys=False):
-                set_attr(grp, k, v)
-
-        if allexist and swmr_mode:
-            f.swmr_mode = True
-
-        for k, v in datadict.data_items():
-            data = v['values']
-            shp = data.shape
-            nrows = shp[0]
-
-            # create new dataset, add axes and unit metadata
-            if k not in grp:
-                maxshp = tuple([None] + list(shp[1:]))
-                ds = grp.create_dataset(k, maxshape=maxshp, data=data)
-
-                # add meta data
-                add_cur_time_attr(ds)
-
-                if v.get('axes', []) != []:
-                    set_attr(ds, 'axes', v['axes'])
-                if v.get('unit', "") != "":
-                    set_attr(ds, 'unit', v['unit'])
-
-                for kk, vv in datadict.meta_items(k, clean_keys=False):
-                    set_attr(ds, kk, vv)
-
-                ds.flush()
-
-            # if the dataset already exits, append data according to
-            # chosen append mode.
-            else:
-                ds = grp[k]
-                dslen = ds.shape[0]
-
-                if append_mode == AppendMode.new:
-                    newshp = tuple([nrows] + list(shp[1:]))
-                    ds.resize(newshp)
-                    ds[dslen:] = data[dslen:]
-                elif append_mode == AppendMode.all:
-                    newshp = tuple([dslen + nrows] + list(shp[1:]))
-                    ds.resize(newshp)
-                    ds[dslen:] = data[:]
-
-                ds.flush()
-
+    if groupname in f:
+        del f[groupname]
+        f.flush()
+        grp = f.create_group(groupname)
+        add_cur_time_attr(grp)
+        f.flush()
+    else:
+        grp = f.create_group(groupname)
+        add_cur_time_attr(grp)
         f.flush()
 
 
-def datadict_from_hdf5(basepath: str, groupname: str = 'data',
+def write_data_to_file(datadict: DataDict,
+                       f: h5py.File,
+                       groupname: str = 'data',
+                       append_mode: AppendMode = AppendMode.new,
+                       swmr_mode: bool = True) -> None:
+
+    if groupname not in f:
+        raise RuntimeError('Group does not exist, initialize file first.')
+    grp = f[groupname]
+
+    # if we want to use swmr, we need to make sure that we're not
+    # creating any more objects (see hdf5 docs).
+    allexist = True
+    for k, v in datadict.data_items():
+        if k not in grp:
+            allexist = False
+
+    # add top-level meta data.
+    for k, v in datadict.meta_items(clean_keys=False):
+        set_attr(grp, k, v)
+
+    f.flush()
+    if allexist and swmr_mode and not f.swmr_mode:
+        f.swmr_mode = True
+
+    for k, v in datadict.data_items():
+        data = v['values']
+        shp = data.shape
+        nrows = shp[0]
+
+        # create new dataset, add axes and unit metadata
+        if k not in grp:
+            maxshp = tuple([None] + list(shp[1:]))
+            ds = grp.create_dataset(k, maxshape=maxshp, data=data)
+
+            # add meta data
+            add_cur_time_attr(ds)
+
+            if v.get('axes', []) != []:
+                set_attr(ds, 'axes', v['axes'])
+            if v.get('unit', "") != "":
+                set_attr(ds, 'unit', v['unit'])
+
+            for kk, vv in datadict.meta_items(k, clean_keys=False):
+                set_attr(ds, kk, vv)
+
+            ds.flush()
+
+        # if the dataset already exits, append data according to
+        # chosen append mode.
+        else:
+            ds = grp[k]
+            dslen = ds.shape[0]
+
+            if append_mode == AppendMode.new:
+                newshp = tuple([nrows] + list(shp[1:]))
+                ds.resize(newshp)
+                ds[dslen:] = data[dslen:]
+            elif append_mode == AppendMode.all:
+                newshp = tuple([dslen + nrows] + list(shp[1:]))
+                ds.resize(newshp)
+                ds[dslen:] = data[:]
+
+            ds.flush()
+    f.flush()
+
+
+def file_is_readable(filepath: str,
+                     swmr_mode: bool = True,
+                     n_retries: int = 5,
+                     retry_delay: float = 0.01) -> bool:
+
+    cur_try = 0
+    while True:
+        try:
+            with h5py.File(filepath, mode='r',
+                           libver='latest', swmr=swmr_mode) as f:
+                pass
+            return True
+        except OSError:
+            cur_try += 1
+            if cur_try <= n_retries:
+                time.sleep(retry_delay)
+                cur_try += 1
+            else:
+                raise
+
+
+def datadict_from_hdf5(basepath: str,
+                       groupname: str = 'data',
                        startidx: Union[int, None] = None,
                        stopidx: Union[int, None] = None,
                        structure_only: bool = False,
                        ignore_unequal_lengths: bool = True,
-                       swmr_mode: bool = True) -> DataDict:
+                       swmr_mode: bool = True,
+                       n_retries: int = 5,
+                       retry_delay: float = 0.01) -> DataDict:
     """Load a DataDict from file.
 
     :param basepath: full filepath without the file extension
@@ -238,7 +296,6 @@ def datadict_from_hdf5(basepath: str, groupname: str = 'data',
     if len(basepath) > len(DATAFILEXT) and \
             basepath[-len(DATAFILEXT):] == DATAFILEXT:
         filepath = basepath
-        basepath = basepath[:-len(DATAFILEXT)]
     else:
         filepath = basepath + DATAFILEXT
 
@@ -247,6 +304,10 @@ def datadict_from_hdf5(basepath: str, groupname: str = 'data',
 
     if startidx is None:
         startidx = 0
+
+    if file_is_readable(filepath, swmr_mode=swmr_mode,
+                        n_retries=n_retries, retry_delay=retry_delay):
+        pass
 
     res = {}
     with h5py.File(filepath, 'r', libver='latest', swmr=swmr_mode) as f:
@@ -272,28 +333,27 @@ def datadict_from_hdf5(basepath: str, groupname: str = 'data',
                 res[attr] = deh5ify(grp.attrs[attr])
 
         for k in keys:
-            try:
-                ds = grp[k]
-                entry = dict(values=np.array([]), )
+            ds = grp[k]
+            entry: Dict[str, Union[Collection[Any], np.ndarray]] = dict(values=np.array([]), )
 
-                if 'axes' in ds.attrs:
-                    entry['axes'] = deh5ify(ds.attrs['axes']).tolist()
-                else:
-                    entry['axes'] = []
+            if 'axes' in ds.attrs:
+                entry['axes'] = deh5ify(ds.attrs['axes']).tolist()
+            else:
+                entry['axes'] = []
 
-                if 'unit' in ds.attrs:
-                    entry['unit'] = deh5ify(ds.attrs['unit'])
+            if 'unit' in ds.attrs:
+                entry['unit'] = deh5ify(ds.attrs['unit'])
 
-                if not structure_only:
-                    entry['values'] = ds[startidx:stopidx]
+            if not structure_only:
+                entry['values'] = ds[startidx:stopidx]
 
-                # and now the meta data
-                for attr in ds.attrs:
-                    if is_meta_key(attr):
-                        entry[attr] = deh5ify(ds.attrs[attr])
+            entry['__shape__'] = ds[:].shape
 
-            except:
-                raise
+            # and now the meta data
+            for attr in ds.attrs:
+                if is_meta_key(attr):
+                    _val = deh5ify(ds.attrs[attr])
+                    entry[attr] = deh5ify(ds.attrs[attr])
 
             res[k] = entry
 
@@ -302,16 +362,39 @@ def datadict_from_hdf5(basepath: str, groupname: str = 'data',
     return dd
 
 
+def all_datadicts_from_hdf5(basepath: str, **kwargs: Any) -> Dict[str, Any]:
+    if len(basepath) > len(DATAFILEXT) and \
+            basepath[-len(DATAFILEXT):] == DATAFILEXT:
+        filepath = basepath
+    else:
+        filepath = basepath + DATAFILEXT
+
+    if not os.path.exists(filepath):
+        raise ValueError("Specified file does not exist.")
+
+    ret = {}
+    if file_is_readable(filepath, swmr_mode=kwargs.get('swmr_mode', True)):
+        with h5py.File(filepath, mode='r', libver='latest',
+                       swmr=kwargs.get('swmr_mode', True)) as f:
+            keys = [k for k in f.keys()]
+
+        for k in keys:
+            ret[k] = datadict_from_hdf5(basepath=basepath, groupname=k, **kwargs)
+
+    return ret
+
+
 # Node for monitoring #
 
 class DDH5LoaderWidget(NodeWidget):
 
-    def __init__(self, node: Node = None):
+    def __init__(self, node: Node):
         super().__init__(node=node)
+        assert self.node is not None
 
-        self.fileinput = QtGui.QLineEdit()
-        self.groupinput = QtGui.QLineEdit('data')
-        self.reload = QtGui.QPushButton('Reload')
+        self.fileinput = QtWidgets.QLineEdit()
+        self.groupinput = QtWidgets.QLineEdit('data')
+        self.reload = QtWidgets.QPushButton('Reload')
 
         self.optSetters = {
             'filepath': self.fileinput.setText,
@@ -322,11 +405,11 @@ class DDH5LoaderWidget(NodeWidget):
             'groupname': self.groupinput.text,
         }
 
-        flayout = QtGui.QFormLayout()
+        flayout = QtWidgets.QFormLayout()
         flayout.addRow('File path:', self.fileinput)
         flayout.addRow('Group:', self.groupinput)
 
-        vlayout = QtGui.QVBoxLayout()
+        vlayout = QtWidgets.QVBoxLayout()
         vlayout.addLayout(flayout)
         vlayout.addWidget(self.reload)
 
@@ -345,48 +428,57 @@ class DDH5Loader(Node):
     nodeName = 'DDH5Loader'
     uiClass = DDH5LoaderWidget
     useUi = True
+    nRetries = 5
+    retryDelay = 0.01
 
     def __init__(self, name: str):
-        self._filepath = None
-        self._groupname = None
+        self._filepath: Optional[str] = None
 
         super().__init__(name)
 
-        self.groupname = 'data'
+        self.groupname = 'data'  # type: ignore[misc]
         self.nLoadedRecords = 0
 
-    # Properties #
-
     @property
-    def filepath(self):
+    def filepath(self) -> Optional[str]:
         return self._filepath
 
-    @filepath.setter
+    @filepath.setter  # type: ignore[misc]
     @updateOption('filepath')
-    def filepath(self, val):
+    def filepath(self, val: str) -> None:
         self._filepath = val
 
     @property
-    def groupname(self):
+    def groupname(self) -> str:
         return self._groupname
 
-    @groupname.setter
+    @groupname.setter  # type: ignore[misc]
     @updateOption('groupname')
-    def groupname(self, val):
+    def groupname(self, val: str) -> None:
         self._groupname = val
 
     # Data processing #
 
-    def process(self, dataIn=None):
+    def process(self, dataIn: Optional[DataDictBase] = None) -> Optional[Dict[str, Any]]:
         if self._filepath is None or self._groupname is None:
             return None
         if not os.path.exists(self._filepath):
             return None
 
-        data = datadict_from_hdf5(self._filepath, groupname=self.groupname)
+        try:
+            data = datadict_from_hdf5(self._filepath,
+                                      groupname=self.groupname,
+                                      n_retries=self.nRetries,
+                                      retry_delay=self.retryDelay)
+        except OSError:
+            # TODO needs logging
+            return None
+
         title = f"{self.filepath}"
         data.add_meta('title', title)
-        self.nLoadedRecords = data.nrecords()
+        nrecords = data.nrecords()
+        assert nrecords is not None
+        self.nLoadedRecords = nrecords
 
         if super().process(dataIn=data) is None:
             return None
@@ -395,54 +487,131 @@ class DDH5Loader(Node):
 
 
 class DDH5Writer(object):
+    """Context manager for writing data to DDH5.
+    Based on typical needs in taking data in an experimental physics lab.
 
-    def __init__(self, basedir, datadict):
+    Example usage::
+        >>> data = DataDict(
+        ...     x = dict(unit='x_unit'),
+        ...     y = dict(unit='y_unit', axes=['x'])
+        ... )
+        ... with DDH5Writer('./data/', data, name='Test') as writer:
+        ...     for x in range(10):
+        ...         writer.add_data(x=x, y=x**2)
+        Data location: ./data/2020-06-05/2020-06-05_0001_Example/2020-06-05_0001_Test.ddh5
+
+    :param basedir: The root directory in which data is stored.
+        :meth:`.create_file_structure` is creating the structure inside this root and
+        determines the file name of the data. The default structure implemented here is
+        ``<root>/YYYY-MM-DD/YYYY-MM-DD_<idx>_<name>/YYYY-MM-DD_<idx>_<name>.ddh5``,
+        where <idx> is the automatically increasing number of this dataset in the day
+        folder and <name> is the value of parameter `name`. To change this, re-implement
+        :meth:`.create_file_structure`.
+    :param datadict: initial data object. Must contain at least the structure of the
+        data to be able to use :meth:`add_data` to add data.
+    :param groupname: name of the top-level group in the file container. An existing
+        group of that name will be deleted.
+    :param name: name of this dataset. Used in path/file creation and added as meta data.
+    """
+
+    # TODO: need an operation mode for not keeping data in memory.
+    # TODO: a mode for working with pre-allocated data
+
+    def __init__(self, basedir: str,
+                 datadict: DataDict,
+                 groupname: str = 'data',
+                 name: Optional[str] = None):
+        """Constructor for :class:`.DDH5Writer`"""
+
         self.basedir = basedir
         self.datadict = datadict
-        self.basepath = None
         self.inserted_rows = 0
+        self.name = name
+        self.groupname = groupname
 
-    def __enter__(self):
-        folder = os.path.join(
-            self.basedir,
-            time.strftime("%Y-%m-%d"),
-        )
-        os.makedirs(folder, exist_ok=True)
-        filebase = time.strftime("%Y-%m-%d_")
+        self.file_base: Optional[str] = None
+        self.file_path: Optional[str] = None
+        self.file: Optional[h5py.File] = None
 
-        files = os.listdir(folder)
-        datafiles = [f for f in files if
-                     ((os.path.splitext(f)[1] == DATAFILEXT)
-                      and (f[:len(filebase)] == filebase))]
+        self.datadict.add_meta('dataset.name', name)
 
-        if len(datafiles) > 0:
-            datafiles.sort()
-            idx = int(os.path.splitext(datafiles[-1])[0][-3:]) + 1
-            suffix = f"{idx:03}"
-        else:
-            suffix = '001'
+    def __enter__(self) -> "DDH5Writer":
+        self.file_base = self.create_file_structure()
+        self.file_path = self.file_base + f"{DATAFILEXT}"
+        print('Data location: ', self.file_path)
 
-        self.basepath = os.path.join(folder, filebase + suffix)
-        print('Datafile: ', self.basepath)
+        self.file = h5py.File(self.file_path, mode='a', libver='latest')
+        init_file(self.file, self.groupname)
+        add_cur_time_attr(self.file, name='last_change')
+        add_cur_time_attr(self.file[self.groupname], name='last_change')
 
-        if self.datadict.nrecords() > 0:
-            datadict_to_hdf5(self.datadict, self.basepath,
-                             append_mode=AppendMode.none)
-            self.inserted_rows = self.datadict.nrecords()
+        nrecords = self.datadict.nrecords()
+        if nrecords is not None and nrecords > 0:
+            write_data_to_file(self.datadict, self.file, groupname=self.groupname,
+                               append_mode=AppendMode.none)
+            n_new_records = self.datadict.nrecords()
+            assert n_new_records is not None
+            self.inserted_rows = n_new_records
 
         return self
 
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        pass
+    def __exit__(self,
+                 exc_type: Optional[Type[BaseException]],
+                 exc_value: Optional[BaseException],
+                 exc_traceback: Optional[TracebackType]) -> None:
+        assert self.file is not None
+        add_cur_time_attr(self.file[self.groupname], name='close')
+        self.file.close()
 
-    def add_data(self, **kw):
-        self.datadict.add_data(**kw)
+    def create_file_structure(self) -> str:
+        """Determine the filepath and create all subfolders.
+
+        :returns: the filepath (without extension) of the data file.
+        """
+        day_folder_path = os.path.join(self.basedir, time.strftime("%Y-%m-%d"))
+        os.makedirs(day_folder_path, exist_ok=True)
+
+        filebase = time.strftime("%Y-%m-%d_")
+        existing_datafolders = [f for f in os.listdir(day_folder_path)
+                                if f[:len(filebase)] == filebase]
+        prev_idxs = [int(f[len(filebase):len(filebase)+4]) for f in existing_datafolders]
+        if len(prev_idxs) == 0:
+            new_idx = 1
+        else:
+            new_idx = max(prev_idxs) + 1
+        filebase += f"{new_idx:04}"
+        if self.name is not None:
+            filebase += f"_{self.name}"
+
+        data_folder_path = os.path.join(day_folder_path, filebase)
+        os.makedirs(data_folder_path, exist_ok=True)
+
+        return os.path.join(data_folder_path, filebase)
+
+    def add_data(self, **kwargs: Any) -> None:
+        """Add data to the file (and the internal `DataDict`).
+
+        Requires one keyword argument per data field in the `DataDict`, with
+        the key being the name, and value the data to add. It is required that
+        all added data has the same number of 'rows', i.e., the most outer dimension
+        has to match for data to be inserted faithfully.
+        If some data is scalar and others are not, then the data should be reshaped
+        to (1, ) for the scalar data, and (1, ...) for the others; in other words,
+        an outer dimension with length 1 is added for all.
+        """
+        assert self.file is not None
+        self.datadict.add_data(**kwargs)
 
         if self.inserted_rows > 0:
             mode = AppendMode.new
         else:
             mode = AppendMode.none
-
-        if self.datadict.nrecords() > 0:
-            datadict_to_hdf5(self.datadict, self.basepath,
-                             append_mode=mode)
+        nrecords = self.datadict.nrecords()
+        if nrecords is not None and nrecords > 0:
+            write_data_to_file(self.datadict,
+                               self.file,
+                               groupname=self.groupname,
+                               append_mode=mode)
+            self.inserted_rows = nrecords
+            add_cur_time_attr(self.file, name='last_change')
+            add_cur_time_attr(self.file[self.groupname], name='last_change')
