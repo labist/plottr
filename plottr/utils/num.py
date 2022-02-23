@@ -2,16 +2,16 @@
 
 Tools for numerical operations.
 """
-from typing import Sequence, Tuple, Union, List, Optional
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 from ..utils.misc import unwrap_optional
 
-INTTYPES = [int, np.int, np.int16, np.int32, np.int64]
-FLOATTYPES = [float, np.float, np.float16, np.float32, np.float64,
-              complex, np.complex, np.complex64, np.complex128]
+INTTYPES = [int, np.int16, np.int32, np.int64]
+FLOATTYPES = [float, np.float16, np.float32, np.float64,
+              complex, np.complex64, np.complex128]
 NUMTYPES = INTTYPES + FLOATTYPES
 
 
@@ -70,8 +70,7 @@ def _are_invalid(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def arrays_equal(a: np.ndarray, b: np.ndarray,
-                 rtol: float = 1e-8, raise_shape_mismatch: bool = False) \
-        -> bool:
+                 rtol: Optional[float] = None) -> bool:
     """Check if two numpy arrays are equal, content-wise.
 
     Perform the following checks:
@@ -85,27 +84,19 @@ def arrays_equal(a: np.ndarray, b: np.ndarray,
     :param a: 1st numpy array
     :param b: 2nd numpy array
     :param rtol: relative uncertainty tolerance. see `numpy.isclose`.
-    :param raise_shape_mismatch: if True, raise `ValueError` when shapes
-                                 are unequal. If `False`, return `False` in that
-                                 case.
     :return: `True`, if all element-wise checks are `True`. `False`
              otherwise.
     :raises: `ValueError` if shapes of `a` and `b` don't match
     """
     if a.shape != b.shape:
-        if raise_shape_mismatch:
-            raise ValueError('Shapes are not equal.')
-        else:
-            return False
+        return False
 
-    close: Union[np.ndarray, np.bool_] = np.zeros(a.shape, dtype=bool)
-    if a.dtype in FLOATTYPES and b.dtype in FLOATTYPES:
+    close: Union[np.ndarray, np.bool_] = np.zeros_like(a, dtype=bool)
+    if rtol is not None and a.dtype in FLOATTYPES and b.dtype in FLOATTYPES:
         close = _are_close(a, b, rtol=rtol)
-
     equal = _are_equal(a, b)
     invalid = _are_invalid(a, b)
-
-    return np.all(equal | close | invalid)
+    return bool(np.all(equal | close | invalid))
 
 
 def array1d_to_meshgrid(arr: Union[List, np.ndarray],
@@ -132,7 +123,7 @@ def array1d_to_meshgrid(arr: Union[List, np.ndarray],
         localarr = localarr.copy()
     localarr = localarr.reshape(-1)
 
-    newsize = np.prod(target_shape)
+    newsize = int(np.prod(target_shape))
     if newsize < localarr.size:
         localarr = localarr[:newsize]
     elif newsize > localarr.size:
@@ -148,7 +139,7 @@ def array1d_to_meshgrid(arr: Union[List, np.ndarray],
 def _find_switches(arr: np.ndarray,
                    rth: float = 25,
                    ztol: float = 1e-15) -> np.ndarray:
-    arr_ = np.ma.MaskedArray(arr, is_invalid(arr))
+    arr_: np.ndarray = np.ma.MaskedArray(arr, is_invalid(arr))
     deltas = arr_[1:] - arr_[:-1]
     hi = np.percentile(arr[~is_invalid(arr)], 100.-rth)
     lo = np.percentile(arr[~is_invalid(arr)], rth)
@@ -351,7 +342,10 @@ def joint_crop2d_rows_cols(*arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         xs += _x.tolist()
         ys += _y.tolist()
 
-    return np.array(list(set(xs))), np.array(list(set(ys)))
+    return (
+        np.array(list(set(xs)), dtype=np.int64),
+        np.array(list(set(ys)), dtype=np.int64),
+    )
 
 
 def crop2d_from_xy(arr: np.ndarray, xs: np.ndarray,

@@ -23,7 +23,10 @@ __author__ = 'Wolfgang Pfaff'
 __license__ = 'MIT'
 
 if TYPE_CHECKING:
-    from qcodes.dataset.data_set import DataSet
+    try:
+        from qcodes.dataset import DataSetProtocol
+    except ImportError:
+        from qcodes.dataset.data_set import DataSet as DataSetProtocol
     from qcodes import ParamSpec
 
 
@@ -61,13 +64,14 @@ class DataSetInfoDict(TypedDict):
     structure: Optional[DataSetStructureDict]
     records: int
     guid: str
+    inspectr_tag: str
 
 
 # Tools for extracting information on runs in a database
 
 
 def get_ds_structure(
-        ds: 'DataSet'
+        ds: 'DataSetProtocol'
 ) -> DataSetStructureDict:
     """
     Return the structure of the dataset, i.e., a dictionary in the form
@@ -111,7 +115,7 @@ def get_ds_structure(
     return structure
 
 
-def get_ds_info(ds: 'DataSet', get_structure: bool = True) -> DataSetInfoDict:
+def get_ds_info(ds: 'DataSetProtocol', get_structure: bool = True) -> DataSetInfoDict:
     """
     Get some info on a DataSet in dict.
 
@@ -149,13 +153,14 @@ def get_ds_info(ds: 'DataSet', get_structure: bool = True) -> DataSetInfoDict:
         started_time=started_time,
         structure=structure,
         records=ds.number_of_results,
-        guid=ds.guid
+        guid=ds.guid,
+        inspectr_tag=ds.metadata.get('inspectr_tag', ''),
     )
 
     return data
 
 
-def load_dataset_from(path: str, run_id: int) -> 'DataSet':
+def load_dataset_from(path: str, run_id: int) -> 'DataSetProtocol':
     """
     Loads ``DataSet`` with the given ``run_id`` from a database file that
     is located in in the given ``path``.
@@ -209,7 +214,7 @@ def get_runs_from_db_as_dataframe(path: str) -> pd.DataFrame:
 
 # Extracting data
 
-def ds_to_datadicts(ds: 'DataSet') -> Dict[str, DataDict]:
+def ds_to_datadicts(ds: 'DataSetProtocol') -> Dict[str, DataDict]:
     """
     Make DataDicts from a qcodes DataSet.
 
@@ -240,7 +245,7 @@ def ds_to_datadicts(ds: 'DataSet') -> Dict[str, DataDict]:
     return ret
 
 
-def ds_to_datadict(ds: 'DataSet') -> DataDictBase:
+def ds_to_datadict(ds: 'DataSetProtocol') -> DataDictBase:
     ddicts = ds_to_datadicts(ds)
     ddict = combine_datadicts(*[v for k, v in ddicts.items()])
     return ddict
@@ -256,7 +261,7 @@ class QCodesDSLoader(Node):
     def __init__(self, *arg: Any, **kw: Any):
         self._pathAndId: Tuple[Optional[str], Optional[int]] = (None, None)
         self.nLoadedRecords = 0
-        self._dataset: Optional[DataSet] = None
+        self._dataset: Optional[DataSetProtocol] = None
 
         super().__init__(*arg, **kw)
 
@@ -287,24 +292,42 @@ class QCodesDSLoader(Node):
             if self._dataset.number_of_results > self.nLoadedRecords:
 
                 guid = self._dataset.guid
+
+                experiment_name = self._dataset.exp_name
+                sample_name = self._dataset.sample_name
+                dataset_name = self._dataset.name
+
+                run_timestamp = self._dataset.run_timestamp()
+                completed_timestamp = self._dataset.completed_timestamp()
+
                 title = f"{os.path.split(path)[-1]} | " \
-                        f"run ID: {runId} | GUID: {guid}"
-                info = """Started: {}
-Finished: {}
-GUID: {}
-DB-File [ID]: {} [{}]""".format(self._dataset.run_timestamp(), self._dataset.completed_timestamp(),
-                                guid, path, runId)
+                        f"run ID: {runId} | GUID: {guid}" \
+                        "\n" \
+                        f"{sample_name} | {experiment_name} | {dataset_name}"
+
+                info = f"""Started: {run_timestamp}
+Finished: {completed_timestamp}
+DB-File [ID]: {path} [{runId}]"""
 
                 data = ds_to_datadict(self._dataset)
+
+                data.add_meta('qcodes_experiment_name', experiment_name)
+                data.add_meta('qcodes_sample_name', sample_name)
+                data.add_meta('qcodes_dataset_name', dataset_name)
+
                 data.add_meta('title', title)
                 data.add_meta('info', info)
+
                 data.add_meta('qcodes_guid', guid)
                 data.add_meta('qcodes_db', path)
                 data.add_meta('qcodes_runId', runId)
-                data.add_meta('qcodes_completedTS', self._dataset.completed_timestamp())
-                data.add_meta('qcodes_runTS', self._dataset.run_timestamp())
+                data.add_meta('qcodes_completedTS', completed_timestamp)
+                data.add_meta('qcodes_runTS', run_timestamp)
                 qcodes_shape = getattr(self._dataset.description, "shapes", None)
                 data.add_meta('qcodes_shape', qcodes_shape)
+
                 self.nLoadedRecords = self._dataset.number_of_results
+
                 return dict(dataOut=data)
+
         return None

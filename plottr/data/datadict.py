@@ -5,6 +5,7 @@ Data classes we use throughout the plottr package, and tools to work on them.
 """
 import warnings
 import copy as cp
+import re
 
 import numpy as np
 from functools import reduce
@@ -62,70 +63,9 @@ class DataDictBase(dict):
     def __eq__(self, other: object) -> bool:
         """Check for content equality of two datadicts."""
         if not isinstance(other, DataDictBase):
-            return NotImplemented
-
-        if not self.same_structure(self, other):
-            # print('structure')
             return False
-
-        for k, v in self.meta_items():
-            if k not in [kk for kk, vv in other.meta_items()]:
-                # print(f'{k} not in {other}')
-                return False
-            elif other.meta_val(k) != v:
-                # print(f'{other.meta_val(k)} != {v}')
-                return False
-
-        for k, v in other.meta_items():
-            if k not in [kk for kk, vv in self.meta_items()]:
-                # print(f'{k} not in {self}')
-                return False
-
-        for dn, dv in self.data_items():
-            # print(dn)
-            if dn not in [dnn for dnn, dvv in other.data_items()]:
-                # print(f"{dn} not in {other}")
-                return False
-
-            if self[dn].get('unit', '') != other[dn].get('unit', ''):
-                # print(f"different units for {dn}")
-                return False
-
-            if self[dn].get('label', '') != other[dn].get('label', ''):
-                # print(f"different labels for {dn}")
-                return False
-
-            if self[dn].get('axes', []) != other[dn].get('axes', []):
-                # print(f"different axes for {dn}")
-                return False
-
-            if not num.arrays_equal(
-                np.array(self.data_vals(dn)),
-                np.array(other.data_vals(dn)),
-            ):
-                # print(f"different data for {dn}")
-                return False
-
-            for k, v in self.meta_items(dn):
-                if k not in [kk for kk, vv in other.meta_items(dn)]:
-                    # print(f"{dn}: {k} not in {other}")
-                    return False
-                elif v != other.meta_val(k, dn):
-                    # print(f"{v} != {other.meta_val(k, dn)}")
-                    return False
-
-        for dn, dv in other.data_items():
-            # print(dn)
-            if dn not in [dnn for dnn, dvv in self.data_items()]:
-                # print(f"{dn} not in {other}")
-                return False
-
-            for k, v in other.meta_items(dn):
-                if k not in [kk for kk, vv in self.meta_items(dn)]:
-                    # print(f"{dn}: {k} not in {other}")
-                    return False
-
-        return True
+        else:
+            return datasets_are_equal(self, other)
 
     # Assignment and retrieval of data and meta data
 
@@ -140,6 +80,53 @@ class DataDictBase(dict):
     @staticmethod
     def _meta_name_to_key(name: str) -> str:
         return meta_name_to_key(name)
+
+    @staticmethod
+    def to_records(**data: Any) -> Dict[str, np.ndarray]:
+        """Convert data to rows that can be added to the ``DataDict``.
+        All data is converted to np.array, and the first dimension of all resulting
+        arrays has the same length (chosen to be the smallest possible number
+        that does not alter any shapes beyond adding a length-1 dimension as
+        first dimesion, if necessary).
+
+        If a field is given as ``None``, it will be converted to ``numpy.array([numpy.nan])``.
+        """
+        records: Dict[str, np.ndarray] = {}
+
+        seqtypes = (np.ndarray, tuple, list)
+        nantypes = (type(None), )
+
+        for k, v in data.items():
+            if isinstance(v, seqtypes):
+                records[k] = np.array(v)
+            elif isinstance(v, nantypes):
+                records[k] = np.array([np.nan])
+            else:
+                records[k] = np.array([v])
+
+        possible_nrecords = {}
+        for k, v in records.items():
+            possible_nrecords[k] = [1, v.shape[0]]
+
+        commons = []
+        for k, v in possible_nrecords.items():
+            for n in v:
+                if n in commons:
+                    continue
+                is_common = True
+                for kk, vv in possible_nrecords.items():
+                    if n not in vv:
+                        is_common = False
+                if is_common:
+                    commons.append(n)
+        nrecs = max(commons)
+
+        for k, v in records.items():
+            shp = v.shape
+            if nrecs == 1 and shp[0] > 1:
+                newshp = tuple([1] + list(shp))
+                records[k] = v.reshape(newshp)
+        return records
 
     def data_items(self) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """
@@ -736,7 +723,7 @@ class DataDict(DataDictBase):
         for k, v in newvals.items():
             self[k]['values'] = v
 
-    def add_data(self, **kw: Sequence) -> None:
+    def add_data(self, **kw: Any) -> None:
         # TODO: fill non-given data with nan or none
         """
         Add data to all values. new data must be valid in itself.
@@ -748,17 +735,17 @@ class DataDict(DataDictBase):
         :return: None
         """
         dd = misc.unwrap_optional(self.structure(same_type=True))
-        for k, v in kw.items():
-            if isinstance(v, list):
-                dd[k]['values'] = np.array(v)
-            elif isinstance(v, np.ndarray):
-                dd[k]['values'] = v
-            else:
-                dd[k]['values'] = np.array([v])
+        for name, _ in dd.data_items():
+            if name not in kw:
+                kw[name] = None
+
+        records = self.to_records(**kw)
+        for name, datavals in records.items():  #
+            dd[name]['values'] = datavals
 
         if dd.validate():
-            records = self.nrecords()
-            if records is not None and records > 0:
+            nrecords = self.nrecords()
+            if nrecords is not None and nrecords > 0:
                 self.append(dd)
             else:
                 for key, val in dd.data_items():
@@ -913,9 +900,9 @@ class DataDict(DataDictBase):
                 rows = self.data_vals(d)
             else:
                 datavals = self.data_vals(d)
-                rows = datavals.reshape(-1, np.prod(ishp[d]))
+                rows = datavals.reshape(-1, int(np.prod(ishp[d])))
 
-            _idxs = np.array([])
+            _idxs: np.ndarray = np.array([])
 
             # get indices of all rows that are fully None
             if len(ishp[d]) == 0:
@@ -935,11 +922,10 @@ class DataDict(DataDictBase):
             except TypeError:
                 pass
 
-            idxs.append(_idxs)
+            idxs.append(_idxs.astype(int))
 
         if len(idxs) > 0:
-            remove_idxs = reduce(np.intersect1d,
-                                 tuple(np.array(idxs).astype(int)))
+            remove_idxs = reduce(np.intersect1d, tuple(idxs))
             for k, v in ret.data_items():
                 v['values'] = np.delete(v['values'], remove_idxs, axis=0)
 
@@ -1288,6 +1274,196 @@ def combine_datadicts(*dicts: DataDict) -> Union[DataDictBase, DataDict]:
                 dep_axes = [ax_map[ax] for ax in d[d_dep]['axes']]
                 ret[newdep] = d[d_dep]
                 ret[newdep]['axes'] = dep_axes
-    assert ret is not None
-    ret.validate()
+
+    if ret is None:
+        ret = DataDict()
+    else:
+        ret.validate()
+
     return ret
+
+
+def datastructure_from_string(description: str) -> DataDict:
+    r"""Construct a DataDict from a string description.
+
+    Examples
+    --------
+    * ``"data[mV](x, y)"`` results in a datadict with one dependent ``data`` with unit ``mV`` and
+      two independents, ``x`` and ``y``, that do not have units.
+
+    * ``"data_1[mV](x, y); data_2[mA](x); x[mV]; y[nT]"`` results in two dependents,
+      one of them depening on ``x`` and ``y``, the other only on ``x``.
+      Note that ``x`` and ``y`` have units. We can (but do not have to) omit them when specifying
+      the dependencies.
+
+    * ``"data_1[mV](x[mV], y[nT]); data_2[mA](x[mV])"``. Same result as the previous example.
+
+    Rules
+    -----
+    We recognize descriptions of the form ``field1[unit1](ax1, ax2, ...); field1[unit2](...); ...``.
+
+    * field names (like ``field1`` and ``field2`` above) have to start with a letter, and may contain
+      word characters
+    * field descriptors consist of the name, optional unit (presence signified by square brackets),
+      and optional dependencies (presence signified by round brackets).
+    * dependencies (axes) are implicitly recognized as fields (and thus have the same naming restrictions as field
+      names)
+    * axes are separated by commas
+    * axes may have a unit when specified as dependency, but besides the name, square brackets, and commas no other
+      characters are recognized within the round brackets that specify the dependency
+    * in addition to being specified as dependency for a field, axes may be specified also as additional field without
+      dependency, for instance to specify the unit (may simplify the string). For example,
+      ``z1[x, y]; z2[x, y]; x[V]; y[V]``
+    * units may only consist of word characters
+    * use of unexpected characters will result in the ignoring the part that contains the symbol
+    * the regular expression used to find field descriptors is:
+      ``((?<=\A)|(?<=\;))[a-zA-Z]+\w*(\[\w*\])?(\(([a-zA-Z]+\w*(\[\w*\])?\,?)*\))?``
+    """
+
+    description = description.replace(" ", "")
+
+    data_name_pattern = r"[a-zA-Z]+\w*(\[\w*\])?"
+    pattern = r"((?<=\A)|(?<=\;))" + data_name_pattern + r"(\((" + data_name_pattern + r"\,?)*\))?"
+    r = re.compile(pattern)
+
+    data_fields = []
+    while (r.search(description)):
+        match = r.search(description)
+        if match is None: break
+        data_fields.append(description[slice(*match.span())])
+        description = description[match.span()[1]:]
+
+    dd: Dict[str, Any] = dict()
+
+    def analyze_field(df: str) -> Tuple[str, Optional[str], Optional[List[str]]]:
+        has_unit = True if '[' in df and ']' in df else False
+        has_dependencies = True if '(' in df and ')' in df else False
+
+        name: str = ""
+        unit: Optional[str] = None
+        axes: Optional[List[str]] = None
+
+        if has_unit:
+            name = df.split('[')[0]
+            unit = df.split('[')[1].split(']')[0]
+            if has_dependencies:
+                axes = df.split('(')[1].split(')')[0].split(',')
+        elif has_dependencies:
+            name = df.split('(')[0]
+            axes = df.split('(')[1].split(')')[0].split(',')
+        else:
+            name = df
+
+        if axes is not None and len(axes) == 0:
+            axes = None
+        return name, unit, axes
+
+    for df in data_fields:
+        name, unit, axes = analyze_field(df)
+
+        # double specifying is only allowed for independents.
+        # if an independent is specified multiple times, units must not collide
+        # (but units do not have to be specified more than once)
+        if name in dd:
+            if 'axes' in dd[name] or axes is not None:
+                raise ValueError(f'{name} is specified more than once.')
+            if 'unit' in dd[name] and unit is not None and dd[name]['unit'] != unit:
+                raise ValueError(f'conflicting units for {name}')
+
+        dd[name] = dict()
+        if unit is not None:
+            dd[name]['unit'] = unit
+
+        if axes is not None:
+            for ax in axes:
+                ax_name, ax_unit, ax_axes = analyze_field(ax)
+
+                # we do not allow nested dependencies.
+                if ax_axes is not None:
+                    raise ValueError(f'{ax_name} is independent, may not have dependencies')
+
+                # we can add fields implicitly from dependencies.
+                # independents may be given both implicitly and explicitly, but only
+                # when units don't collide.
+                if ax_name not in dd:
+                    dd[ax_name] = dict()
+                    if ax_unit is not None:
+                        dd[ax_name]['unit'] = ax_unit
+                else:
+                    if 'unit' in dd[ax_name] and ax_unit is not None and dd[ax_name]['unit'] != ax_unit:
+                        raise ValueError(f'conflicting units for {ax_name}')
+
+                if 'axes' not in dd[name]:
+                    dd[name]['axes'] = []
+                dd[name]['axes'].append(ax_name)
+
+    return DataDict(**dd)
+
+#: shortcut to :func:`.datastructure_from_string`.
+str2dd = datastructure_from_string
+
+
+def datasets_are_equal(a: DataDictBase, b: DataDictBase,
+                       ignore_meta: bool = False) -> bool:
+    """Check whether two datasets are equal.
+
+    Compares type, structure, and content of all fields.
+
+    :param a: first dataset
+    :param b: second dataset
+    :param ignore_meta: if ``True``, do not verify if metadata matches.
+    :returns: ``True`` or ``False``
+    """
+
+    if not type(a) == type(b):
+        return False
+
+    if not a.same_structure(a, b):
+        return False
+
+    if not ignore_meta:
+        # are all meta data of a also in b, and are they the same value?
+        for k, v in a.meta_items():
+            if k not in [kk for kk, vv in b.meta_items()]:
+                return False
+            elif b.meta_val(k) != v:
+                return False
+
+        # are all meta data of b also in a?
+        for k, v in b.meta_items():
+            if k not in [kk for kk, vv in a.meta_items()]:
+                return False
+
+    # check all data fields in a
+    for dn, dv in a.data_items():
+
+        # are all fields also present in b?
+        if dn not in [dnn for dnn, dvv in b.data_items()]:
+            return False
+
+        # check if data is equal
+        if not num.arrays_equal(
+                np.array(a.data_vals(dn)),
+                np.array(b.data_vals(dn)),
+        ):
+            return False
+
+        if not ignore_meta:
+            # check meta data
+            for k, v in a.meta_items(dn):
+                if k not in [kk for kk, vv in b.meta_items(dn)]:
+                    return False
+                elif v != b.meta_val(k, dn):
+                    return False
+
+    # only thing left to check is whether there are items in b but not a
+    for dn, dv in b.data_items():
+        if dn not in [dnn for dnn, dvv in a.data_items()]:
+            return False
+
+        if not ignore_meta:
+            for k, v in b.meta_items(dn):
+                if k not in [kk for kk, vv in a.meta_items(dn)]:
+                    return False
+
+    return True

@@ -6,7 +6,7 @@ import logging
 import os
 import time
 import argparse
-from typing import Union, Tuple, Optional, Type, List, Any
+from typing import Union, Tuple, Optional, Type, List, Any, Type
 from packaging import version
 
 from .. import QtCore, Flowchart, Signal, Slot, QtWidgets, QtGui
@@ -23,7 +23,9 @@ from ..node.scaleunits import ScaleUnits
 from ..node.grid import DataGridder, GridOption
 from ..node.tools import linearFlowchart
 from ..node.node import Node
-from ..plot import PlotNode, makeFlowchartWithPlot
+from ..node.histogram import Histogrammer
+from ..plot import PlotNode, makeFlowchartWithPlot, PlotWidget
+from ..plot.pyqtgraph.autoplot import AutoPlot as PGAutoPlot
 from ..utils.misc import unwrap_optional
 
 __author__ = 'Wolfgang Pfaff'
@@ -39,7 +41,8 @@ def logger() -> logging.Logger:
     return logger
 
 
-def autoplot(inputData: Union[None, DataDictBase] = None) \
+def autoplot(inputData: Union[None, DataDictBase] = None,
+             plotWidgetClass: Optional[Type[PlotWidget]] = None) \
         -> Tuple[Flowchart, 'AutoPlotMainWindow']:
     """
     Sets up a simple flowchart consisting of a data selector, gridder,
@@ -63,7 +66,8 @@ def autoplot(inputData: Union[None, DataDictBase] = None) \
     }
 
     fc = makeFlowchartWithPlot(nodes)
-    win = AutoPlotMainWindow(fc, widgetOptions=widgetOptions)
+    win = AutoPlotMainWindow(fc, widgetOptions=widgetOptions,
+                             plotWidgetClass=plotWidgetClass)
     win.show()
 
     if inputData is not None:
@@ -125,23 +129,21 @@ class UpdateToolBar(QtWidgets.QToolBar):
 
 class AutoPlotMainWindow(PlotWindow):
 
-    #: Signal() -- emitted when the window is closed
-    windowClosed = Signal()
-
     def __init__(self, fc: Flowchart,
                  parent: Optional[QtWidgets.QMainWindow] = None,
                  monitor: bool = False,
                  monitorInterval: Union[float, None] = None,
                  loaderName: Optional[str] = None,
+                 plotWidgetClass: Optional[Type[PlotWidget]] = None,
                  **kwargs: Any):
 
-        super().__init__(parent, fc=fc, **kwargs)
+        super().__init__(parent, fc=fc, plotWidgetClass=plotWidgetClass,
+                         **kwargs)
 
         self.fc = fc
+        self.loaderNode: Optional[Node] = None
         if loaderName is not None:
             self.loaderNode = fc.nodes()[loaderName]
-        else:
-            self.loaderNode = None
 
         # a flag we use to set reasonable defaults when the first data
         # is processed
@@ -174,6 +176,10 @@ class AutoPlotMainWindow(PlotWindow):
         else:
             self.monitorToolBar = None
 
+        # set some sane defaults any time the data is significantly altered.
+        if self.loaderNode is not None:
+            self.loaderNode.dataFieldsChanged.connect(self.onChangedLoaderData)
+
     def setMonitorInterval(self, val: float) -> None:
         if self.monitorToolBar is not None:
             self.monitorToolBar.setMonitorInterval(val)
@@ -185,8 +191,7 @@ class AutoPlotMainWindow(PlotWindow):
         """
         if self.monitorToolBar is not None:
             self.monitorToolBar.stop()
-        self.windowClosed.emit()
-        return event.accept()
+        return super().closeEvent(event)
 
     def showTime(self) -> None:
         """
@@ -194,6 +199,13 @@ class AutoPlotMainWindow(PlotWindow):
         """
         tstamp = time.strftime("%Y-%m-%d %H:%M:%S")
         self.status.showMessage(f"loaded: {tstamp}")
+
+    @Slot()
+    def onChangedLoaderData(self) -> None:
+        assert self.loaderNode is not None
+        data = self.loaderNode.outputValues()['dataOut']
+        if data is not None:
+            self.setDefaults(self.loaderNode.outputValues()['dataOut'])
 
     @Slot()
     def refreshData(self) -> None:
@@ -206,7 +218,7 @@ class AutoPlotMainWindow(PlotWindow):
             self.showTime()
 
             if not self._initialized and self.loaderNode.nLoadedRecords > 0:
-                self.setDefaults(self.loaderNode.outputValues()['dataOut'])
+                self.onChangedLoaderData()
                 self._initialized = True
 
     def setInput(self, data: DataDictBase, resetDefaults: bool = True) -> None:
@@ -237,10 +249,17 @@ class AutoPlotMainWindow(PlotWindow):
         if len(axes) == 1:
             drs = {axes[0]: 'x-axis'}
 
-        self.fc.nodes()['Data selection'].selectedData = selected
-        self.fc.nodes()['Grid'].grid = GridOption.guessShape, {}
-        self.fc.nodes()['Dimension assignment'].dimensionRoles = drs
-        unwrap_optional(self.plotWidget).plot.draw()
+        try:
+            self.fc.nodes()['Data selection'].selectedData = selected
+            self.fc.nodes()['Grid'].grid = GridOption.guessShape, {}
+            self.fc.nodes()['Dimension assignment'].dimensionRoles = drs
+        # FIXME: this is maybe a bit excessive, but trying to set all the defaults
+        #   like this can result in many types of errors.
+        #   a better approach would be to inspect the data better and make sure
+        #   we can set defaults reliably.
+        except:
+            pass
+        unwrap_optional(self.plotWidget).update()
 
 
 class QCAutoPlotMainWindow(AutoPlotMainWindow):
@@ -265,10 +284,10 @@ class QCAutoPlotMainWindow(AutoPlotMainWindow):
             pathAndId = path, pathAndId[1]
         self.setWindowTitle(windowTitle)
 
-        if pathAndId is not None:
+        if pathAndId is not None and self.loaderNode is not None:
             self.loaderNode.pathAndId = pathAndId
 
-        if self.loaderNode.nLoadedRecords > 0:
+        if self.loaderNode is not None and self.loaderNode.nLoadedRecords > 0:
             self.setDefaults(self.loaderNode.outputValues()['dataOut'])
             self._initialized = True
 
@@ -327,19 +346,30 @@ def autoplotDDH5(filepath: str = '', groupname: str = 'data') \
         ('Data loader', DDH5Loader),
         ('Data selection', DataSelector),
         ('Grid', DataGridder),
+        ('Histogram', Histogrammer),
         ('Dimension assignment', XYSelector),
-        # ('Subtract average', SubtractAverage),
         ('plot', PlotNode)
     )
 
-    win = AutoPlotMainWindow(fc, loaderName='Data loader', monitor=True,
-                             monitorInterval=2.0)
+    widgetOptions = {
+        "Data selection": dict(visible=True,
+                               dockArea=QtCore.Qt.TopDockWidgetArea),
+        "Histogram": dict(visible=False,
+                          dockArea=QtCore.Qt.TopDockWidgetArea),
+        "Dimension assignment": dict(visible=True,
+                                     dockArea=QtCore.Qt.TopDockWidgetArea),
+    }
+
+    win = AutoPlotMainWindow(fc, loaderName='Data loader',
+                             widgetOptions=widgetOptions,
+                             monitor=True,
+                             monitorInterval=5.0)
     win.show()
 
     fc.nodes()['Data loader'].filepath = filepath
     fc.nodes()['Data loader'].groupname = groupname
     win.refreshData()
-    win.setMonitorInterval(2.0)
+    win.setMonitorInterval(5.0)
 
     return fc, win
 
