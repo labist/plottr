@@ -50,13 +50,22 @@ Note: this package is not compatible with the original `plottr` tool.
 You might want to install freshly if you still use the old version.
 
 ## Requirements:
-* python >= 3.7 (f-strings...)
+* python >= 3.8
 * the usual: numpy, mpl, ...
 * pandas >= 0.22
 * xarray
 * pyqtgraph >= 0.12.1
 
 # Recent changes:
+
+See the [plottr GitHub Releases page](https://github.com/toolsforexperiments/plottr/releases) for versions and their changelogs
+
+## v0.10.0 2022-07-14
+
+### Added 
+
+- added a generalized way for fitting data (or similar procedures that generate analysis parameters from datasets) (#293)
+- ... and more, see here https://github.com/toolsforexperiments/plottr/releases/tag/v0.10.0
 
 ## v0.9.1 2022-01-12
 

@@ -265,8 +265,11 @@ class DimensionAssignmentWidget(QtWidgets.QTreeWidget):
     @Slot(dict)
     def setDimInfos(self, infos: Dict[str, str]) -> None:
         for ax, info in infos.items():
-            self.setInfo(ax, info)
+            self.setDimInfo(ax, info)
 
+    @Slot(dict)
+    def setShapes(self, shapes: Dict[str, Dict[int, int]]) -> None:
+        self._dataShapes = shapes
 
 class DimensionReductionAssignmentWidget(DimensionAssignmentWidget):
 
@@ -294,32 +297,49 @@ class DimensionReductionAssignmentWidget(DimensionAssignmentWidget):
         item = self.findItems(dim, QtCore.Qt.MatchExactly, 0)[0]
 
         if role == ReductionMethod.elementSelection.value:
-            value = kw.get('index', 0)
 
             # only create the slider widget if it doesn't exist yet
             if (self.itemWidget(item, 2) is None) or \
                     (self.choices[dim]['optionsWidget'] is None):
-                assert self._dataStructure is not None
-                assert self._dataShapes is not None
-                # get the number of elements in this dimension
-                axidx = self._dataStructure.axes().index(dim)
-                naxvals = self._dataShapes[dim][axidx]
+                self.setNewSlider(dim, item)
 
-                w = self.elementSelectionSlider(nvals=naxvals, value=value)
-                w.valueChanged.connect(
-                    lambda x: self.elementSelectionSliderChange(dim))
+    def setShapes(self, shapes: Dict[str, Dict[int, int]]) -> None:
+        oldShapes = self._dataShapes
+        super().setShapes(shapes)
+        for dim, values in shapes.items():
+            if dim in self.choices:
+                # Only element selection has a slider that needs to be updated.
+                if self.getRole(dim)[0] == ReductionMethod.elementSelection.value:
+                    # If this shape did not change, don't update the slider.
+                    if oldShapes is not None:
+                        if values != oldShapes[dim]:
+                            self.setNewSlider(dim, self.findItems(dim, QtCore.Qt.MatchExactly, 0)[0])
 
-                scaling = int(np.rint(self.logicalDpiX() / 96.0))
-                width = 150 + 50*(scaling - 1)
-                height = 22*scaling
-                w.setMinimumSize(width, height)
-                w.setMaximumHeight(height)
+    def setNewSlider(self, dim: str, item: QtWidgets.QTreeWidgetItem) -> None:
+        assert self._dataStructure is not None
+        assert self._dataShapes is not None
+        # get the number of elements in this dimension
+        axidx = self._dataStructure.axes().index(dim)
+        naxvals = self._dataShapes[dim][axidx]
 
-                self.choices[dim]['optionsWidget'] = w
-                self.setItemWidget(item, 2, w)
-                self.updateSizes()
+        previousSlider = self.itemWidget(item, 2)
+        sliderValue = 0
+        if isinstance(previousSlider, QtWidgets.QSlider):
+            sliderValue = previousSlider.value()
 
-            self._setElementSelectionInfo(dim)
+        w = self.elementSelectionSlider(nvals=naxvals, value=sliderValue)
+        w.valueChanged.connect(lambda x: self.elementSelectionSliderChange(dim))
+
+        scaling = int(np.rint(self.logicalDpiX() / 96.0))
+        width = 150 + 50 * (scaling - 1)
+        height = 22 * scaling
+        w.setMinimumSize(width, height)
+        w.setMaximumHeight(height)
+
+        self.choices[dim]['optionsWidget'] = w
+        self.setItemWidget(item, 2, w)
+        self.setElementSelectionInfo(dim, item.text(3).split(' (')[0])
+        self.updateSizes()
 
     def elementSelectionSlider(self, nvals: int, value: int = 0) -> QtWidgets.QSlider:
         w = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -333,19 +353,23 @@ class DimensionReductionAssignmentWidget(DimensionAssignmentWidget):
         return w
 
     def elementSelectionSliderChange(self, dim: str) -> None:
-        self._setElementSelectionInfo(dim)
         roles = self.getRoles()
         self.rolesChanged.emit(roles)
 
-    def _setElementSelectionInfo(self, dim: str) -> None:
+    def setElementSelectionInfo(self, dim: str, value: Optional[str] = None) -> None:
         # get the number of elements in this dimension
         assert self._dataStructure is not None
         assert self._dataShapes is not None
         roles = self.getRoles()
         axidx = self._dataStructure.axes().index(dim)
         naxvals = self._dataShapes[dim][axidx]
-        idx = roles[dim]['options']['index']
-        self.setDimInfo(dim, f"({idx + 1}/{naxvals})")
+        text = ''
+        if 'index' in roles[dim]['options']:
+            idx = roles[dim]['options']['index']
+            text = f"({idx + 1}/{naxvals})"
+            if value is not None:
+                text = value + ' ' + text
+        self.setDimInfo(dim, text)
 
 
 class XYSelectionWidget(DimensionReductionAssignmentWidget):
@@ -367,10 +391,12 @@ class XYSelectionWidget(DimensionReductionAssignmentWidget):
                     self.setRole(d, 'None')
 
 
-class DimensionReducerNodeWidget(NodeWidget):
+class DimensionReducerNodeWidget(NodeWidget[DimensionReductionAssignmentWidget]):
 
     def __init__(self, node: Optional[Node] = None):
         super().__init__(embedWidgetClass=DimensionReductionAssignmentWidget)
+        # Not clear how to type that self.widget is not None
+        # iff embedWidgetClass is not None
         assert self.widget is not None
         self.optSetters = {
             'reductions': self.setReductions,
@@ -378,7 +404,6 @@ class DimensionReducerNodeWidget(NodeWidget):
         self.optGetters = {
             'reductions': self.getReductions,
         }
-
         self.widget.rolesChanged.connect(
             lambda x: self.signalOption('reductions'))
 
@@ -414,6 +439,9 @@ class DimensionReducerNodeWidget(NodeWidget):
         assert self.widget is not None
         self.widget.setData(structure, shapes, dtype)
 
+    def setShapes(self, shapes: Dict[str, Dict[int, int]]) -> None:
+        assert self.widget is not None
+        self.widget.setShapes(shapes)
 
 class DimensionReducer(Node):
     """
@@ -441,6 +469,11 @@ class DimensionReducer(Node):
         The function must accept an ``axis = <int>`` keyword, and must return
         an array of dimensionality that is reduced by one compared to its
         input.
+    :reductionValues: ``Dict[str, float]``
+        Holds the value of the currently selected axis index.
+        This only happen when the role is ReductionMethod.elementSelection.
+        Dictionary with the axis as keys and the selected values as values.
+
     """
 
     nodeName = 'DimensionReducer'
@@ -450,8 +483,12 @@ class DimensionReducer(Node):
     #: changed.
     newDataStructure = Signal(object, object, object)
 
+    #: A signal that emits (shapes) when the shapes have changed.
+    dataShapesChanged = Signal(dict)
+
     def __init__(self,  name: str):
         self._reductions: Dict[str, Optional[ReductionType]] = {}
+        self._reductionValues: Dict[str, float] = {}
         self._targetNames: Optional[List[str]] = None
         self._dataStructure = None
 
@@ -463,7 +500,7 @@ class DimensionReducer(Node):
     def reductions(self) -> Dict[str, Optional[ReductionType]]:
         return self._reductions
 
-    @reductions.setter  # type: ignore[misc]
+    @reductions.setter
     @updateOption('reductions')
     def reductions(self, val: Dict[str, Optional[ReductionType]]) -> None:
         self._reductions = val
@@ -472,22 +509,33 @@ class DimensionReducer(Node):
     def targetNames(self) -> Optional[List[str]]:
         return self._targetNames
 
-    @targetNames.setter  # type: ignore[misc]
+    @targetNames.setter
     @updateOption()
     def targetNames(self, val: Optional[List[str]]) -> None:
         self._targetNames = val
+
+    @property
+    def reductionValues(self) -> Dict[str, float]:
+        return self._reductionValues
+
+    @reductionValues.setter
+    @updateOption('reductionValues')
+    def reductionValues(self, val: Dict[str, float]) -> None:
+        self._reductionValues = val
 
     # Data processing
 
     def _applyDimReductions(self, data: DataDictBase) -> Optional[DataDictBase]:
         """Apply the reductions"""
+        reductionValues: Dict[str, float] = {}  # Holds the temporary reduction values before saving them.
+
         if self._targetNames is not None:
             dnames = self._targetNames
         else:
             dnames = data.dependents()
 
         if not isinstance(data, MeshgridDataDict):
-            self.logger().debug(f"Data is not on a grid. "
+            self.node_logger.debug(f"Data is not on a grid. "
                                 f"Reduction functions are ignored, "
                                 f"axes will simply be removed.")
 
@@ -502,7 +550,7 @@ class DimensionReducer(Node):
                 try:
                     idx = data[n]['axes'].index(ax)
                 except IndexError:
-                    self.logger().info(f'{ax} specified for reduction, '
+                    self.node_logger.info(f'{ax} specified for reduction, '
                                        f'but not present in data; ignore.')
 
                 kw['axis'] = idx
@@ -526,7 +574,7 @@ class DimensionReducer(Node):
                         raise RuntimeError("Reduction function is None")
                     newvals = funCall(data[n]['values'], *arg, **kw)
                     if newvals.shape != targetShape:
-                        self.logger().error(
+                        self.node_logger.error(
                             f'Reduction on axis {ax} did not result in the '
                             f'right data shape. ' +
                             f'Expected {targetShape} but got {newvals.shape}.'
@@ -541,11 +589,15 @@ class DimensionReducer(Node):
                         if len(axdata.shape) > len(targetShape):
                             newaxvals = funCall(data[ax]['values'], *arg, **kw)
                             data[ax]['values'] = newaxvals
+                            if ax in self._reductions:
+                                reductionValues[ax] = newaxvals.flat[0]
 
                 del data[n]['axes'][idx]
 
         data = data.sanitize()
         data.validate()
+        if self.reductionValues != reductionValues:
+            self.reductionValues = reductionValues
         return data
 
     def validateOptions(self, data: DataDictBase) -> bool:
@@ -560,13 +612,13 @@ class DimensionReducer(Node):
         for ax, reduction in self._reductions.items():
 
             if ax not in data.axes():
-                self.logger().warning(f"{ax} is not a known dimension. Removing.")
+                self.node_logger.warning(f"{ax} is not a known dimension. Removing.")
                 delete.append(ax)
                 continue
 
             if reduction is None:
                 if isinstance(data, MeshgridDataDict):
-                    self.logger().warning(f'Reduction for axis {ax} is None. '
+                    self.node_logger.warning(f'Reduction for axis {ax} is None. '
                                           f'Removing.')
                     delete.append(ax)
                 else:
@@ -585,13 +637,13 @@ class DimensionReducer(Node):
                     arg = reduction[1]
                     kw = reduction[2]
             except:
-                self.logger().warning(
+                self.node_logger.warning(
                     f'Reduction for axis {ax} not in the right format.'
                 )
                 return False
 
             if not callable(fun) and not isinstance(fun, ReductionMethod):
-                self.logger().error(
+                self.node_logger.error(
                     f'Invalid reduction method for axis {ax}. '
                     f'Needs to be callable or a ReductionMethod type.'
                 )
@@ -600,7 +652,7 @@ class DimensionReducer(Node):
             # reduction methods are only defined for grid data.
             # remove reduction methods if we're not on a grid.
             if isinstance(fun, ReductionMethod) and not isinstance(data, MeshgridDataDict):
-                self.logger().info(f'Reduction set for axis {ax} is only suited for '
+                self.node_logger.info(f'Reduction set for axis {ax} is only suited for '
                                    f'grid data. Removing.')
                 delete.append(ax)
                 continue
@@ -633,14 +685,14 @@ class DimensionReducer(Node):
 
         return dict(dataOut=data)
 
-    # FIXME: include connection to a method that helps updating sliders etc.
     def setupUi(self) -> None:
         super().setupUi()
         assert self.ui is not None
         self.newDataStructure.connect(self.ui.setData)
+        self.dataShapesChanged.connect(self.ui.setShapes)
 
 
-class XYSelectorNodeWidget(NodeWidget):
+class XYSelectorNodeWidget(NodeWidget[XYSelectionWidget]):
 
     def __init__(self, node: Optional[Node] = None):
         self.icon = get_xySelectIcon()
@@ -649,6 +701,7 @@ class XYSelectorNodeWidget(NodeWidget):
 
         self.optSetters = {
             'dimensionRoles': self.setRoles,
+            'reductionValues': self.setReductionValues
         }
         self.optGetters = {
             'dimensionRoles': self.getRoles,
@@ -658,10 +711,10 @@ class XYSelectorNodeWidget(NodeWidget):
             lambda x: self.signalOption('dimensionRoles')
         )
 
-    def getRoles(self) -> Dict[str, str]:
+    def getRoles(self) -> Dict[str, Union[str, Tuple[ReductionMethod, List[Any], Dict[str, Any]]]]:
         assert self.widget is not None
         widgetRoles = self.widget.getRoles()
-        roles = {}
+        roles: Dict[str, Union[str, Tuple[ReductionMethod, List[Any], Dict[str, Any]]]] = {}
         for dimName, rolesOptions in widgetRoles.items():
             role = rolesOptions['role']
             opts = rolesOptions['options']
@@ -677,7 +730,7 @@ class XYSelectorNodeWidget(NodeWidget):
         return roles
 
     def setRoles(self, roles: Dict[str, str]) -> None:
-        assert isinstance(self.widget, XYSelectionWidget)
+        assert self.widget is not None
         # when this is called, we do not want the UI to signal changes.
         self.widget.emitRoleChangeSignal = False
 
@@ -697,12 +750,21 @@ class XYSelectorNodeWidget(NodeWidget):
 
         self.widget.emitRoleChangeSignal = True
 
+    def setReductionValues(self, val: Dict[str, float]) -> None:
+        if self.widget is not None:
+            for dim, value in val.items():
+                self.widget.setElementSelectionInfo(dim, str(value))
+
     def setData(self,
                 structure: DataDictBase,
                 shapes: Dict[str, Dict[int, int]],
                 dtype: Type[DataDictBase]) -> None:
         assert self.widget is not None
         self.widget.setData(structure, shapes, dtype)
+
+    def setShapes(self, shapes: Dict[str, Dict[int, int]]) -> None:
+        assert self.widget is not None
+        self.widget.setShapes(shapes)
 
 
 class XYSelector(DimensionReducer):
@@ -718,7 +780,7 @@ class XYSelector(DimensionReducer):
     def xyAxes(self) -> Tuple[Optional[str], Optional[str]]:
         return self._xyAxes
 
-    @xyAxes.setter  # type: ignore[misc]
+    @xyAxes.setter
     @updateOption('xyAxes')
     def xyAxes(self, val: Tuple[Optional[str], Optional[str]]) -> None:
         self._xyAxes = val
@@ -734,7 +796,7 @@ class XYSelector(DimensionReducer):
             dr[dim] = red
         return dr
 
-    @dimensionRoles.setter  # type: ignore[misc]
+    @dimensionRoles.setter
     @updateOption('dimensionRoles')
     def dimensionRoles(self, val: Dict[str, str]) -> None:
         x = None
@@ -765,22 +827,22 @@ class XYSelector(DimensionReducer):
 
         if len(availableAxes) > 0:
             if self._xyAxes[0] is None:
-                self.logger().debug(
+                self.node_logger.debug(
                     f'x-Axis is None. this will result in empty output data.')
                 return False
             elif self._xyAxes[0] not in availableAxes:
-                self.logger().warning(
+                self.node_logger.warning(
                     f'x-Axis {self._xyAxes[0]} not present in data')
                 return False
 
             if self._xyAxes[1] is None:
-                self.logger().debug(f'y-Axis is None; result will be 1D')
+                self.node_logger.debug(f'y-Axis is None; result will be 1D')
             elif self._xyAxes[1] not in availableAxes:
-                self.logger().warning(
+                self.node_logger.warning(
                     f'y-Axis {self._xyAxes[1]} not present in data')
                 return False
             elif self._xyAxes[1] == self._xyAxes[0]:
-                self.logger().warning(f"y-Axis cannot be equal to x-Axis.")
+                self.node_logger.warning(f"y-Axis cannot be equal to x-Axis.")
                 return False
 
         # below we actually mess with the reduction options, but
@@ -792,7 +854,7 @@ class XYSelector(DimensionReducer):
         delete = []
         for n, _ in self._reductions.items():
             if n in self._xyAxes:
-                self.logger().debug(
+                self.node_logger.debug(
                     f"{n} has been selected as axis, cannot be reduced.")
                 delete.append(n)
         for n in delete:
@@ -803,7 +865,7 @@ class XYSelector(DimensionReducer):
         for ax in availableAxes:
             if ax not in self._xyAxes:
                 if ax not in self._reductions:
-                    self.logger().debug(
+                    self.node_logger.debug(
                         f"{ax} must be reduced. "
                         f"Default to selecting first element.")
 

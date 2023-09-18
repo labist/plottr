@@ -17,7 +17,7 @@ import time
 import sys
 import argparse
 import logging
-from typing import Optional, Sequence, List, Dict, Iterable, Union, cast, Tuple
+from typing import Optional, Sequence, List, Dict, Iterable, Union, cast, Tuple, Mapping
 
 from typing_extensions import TypedDict
 
@@ -37,10 +37,7 @@ from .autoplot import autoplotQcodesDataset, QCAutoPlotMainWindow
 __author__ = 'Wolfgang Pfaff'
 __license__ = 'MIT'
 
-
-def logger() -> logging.Logger:
-    logger = plottrlog.getLogger('plottr.apps.inspectr')
-    return logger
+LOGGER = plottrlog.getLogger('plottr.apps.inspectr')
 
 
 ### Database inspector tool
@@ -68,7 +65,8 @@ class DateList(QtWidgets.QListWidget):
 
         i = 0
         while i < self.count():
-            if self.item(i).text() not in dates:
+            elem = self.item(i)
+            if elem is not None and elem.text() not in dates:
                 item = self.takeItem(i)
                 del item
             else:
@@ -116,7 +114,7 @@ class SortableTreeWidgetItem(QtWidgets.QTreeWidgetItem):
     def __init__(self, strings: Iterable[str]):
         super().__init__(strings)
 
-    def __lt__(self, other: "SortableTreeWidgetItem") -> bool:
+    def __lt__(self, other: QtWidgets.QTreeWidgetItem) -> bool:
         col = self.treeWidget().sortColumn()
         text1 = self.text(col)
         text2 = other.text(col)
@@ -151,6 +149,7 @@ class RunList(QtWidgets.QTreeWidget):
     def showContextMenu(self, position: QtCore.QPoint) -> None:
         model_index = self.indexAt(position)
         item = self.itemFromIndex(model_index)
+        assert item is not None
         current_tag_char = item.text(1)
 
         menu = QtWidgets.QMenu()
@@ -158,13 +157,15 @@ class RunList(QtWidgets.QTreeWidget):
         copy_icon = self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
         copy_action = menu.addAction(copy_icon, "Copy")
 
-        star_action = self.window().starAction
-        star_action.setText('Star' if current_tag_char != self.tag_dict['star'] else 'Unstar')
-        menu.addAction(star_action)
+        window = cast(QCodesDBInspector, self.window())
+        starAction: QtWidgets.QAction = window.starAction # type: ignore[has-type]
 
-        cross_action = self.window().crossAction
-        cross_action.setText('Cross' if current_tag_char != self.tag_dict['cross'] else 'Uncross')
-        menu.addAction(cross_action)
+        starAction.setText('Star' if current_tag_char != self.tag_dict['star'] else 'Unstar')
+        menu.addAction(starAction)
+
+        crossAction: QtWidgets.QAction = window.crossAction # type: ignore[has-type]
+        crossAction.setText('Cross' if current_tag_char != self.tag_dict['cross'] else 'Uncross')
+        menu.addAction(crossAction)
 
         action = menu.exec_(self.mapToGlobal(position))
         if action == copy_action:
@@ -186,7 +187,7 @@ class RunList(QtWidgets.QTreeWidget):
         item = SortableTreeWidgetItem(lst)
         self.addTopLevelItem(item)
 
-    def setRuns(self, selection: Dict[int, Dict[str, str]], show_only_star: bool, show_also_cross: bool) -> None:
+    def setRuns(self, selection: Mapping[int, Mapping[str, str]], show_only_star: bool, show_also_cross: bool) -> None:
         self.clear()
 
         # disable sorting before inserting values to avoid performance hit
@@ -204,7 +205,7 @@ class RunList(QtWidgets.QTreeWidget):
         for i in range(len(self.cols)):
             self.resizeColumnToContents(i)
 
-    def updateRuns(self, selection: Dict[int, Dict[str, str]]) -> None:
+    def updateRuns(self, selection: Mapping[int, Mapping[str, str]]) -> None:
 
         run_added = False
         for runId, record in selection.items():
@@ -216,12 +217,12 @@ class RunList(QtWidgets.QTreeWidget):
             elif len(item) == 1:
                 completed = record.get('completed_date', '') + ' ' + record.get(
                     'completed_time', '')
-                if completed != item[0].text(5):
-                    item[0].setText(5, completed)
+                if completed != item[0].text(6):
+                    item[0].setText(6, completed)
 
                 num_records = str(record.get('records', ''))
-                if num_records != item[0].text(6):
-                    item[0].setText(6, num_records)
+                if num_records != item[0].text(7):
+                    item[0].setText(7, num_records)
             else:
                 raise RuntimeError(f"More than one runs found with runId: "
                                    f"{runId}")
@@ -474,7 +475,7 @@ class QCodesDBInspector(QtWidgets.QMainWindow):
             )
 
         if path:
-            logger().info(f"Opening: {path}")
+            LOGGER.info(f"Opening: {path}")
             self.loadFullDB(path=path)
 
     def loadFullDB(self, path: Optional[str] = None) -> None:
@@ -490,13 +491,13 @@ class QCodesDBInspector(QtWidgets.QMainWindow):
                 self.loadDBProcess.setPath(self.filepath)
 
     def DBLoaded(self, dbdf: pandas.DataFrame) -> None:
-        if dbdf.equals(self.dbdf):
-            logger().debug('DB reloaded with no changes. Skipping update')
+        if self.dbdf is not None and dbdf.equals(self.dbdf):
+            LOGGER.debug('DB reloaded with no changes. Skipping update')
             return None
         self.dbdf = dbdf
         self.dbdfUpdated.emit()
         self.dateList.sendSelectedDates()
-        logger().debug('DB reloaded')
+        LOGGER.debug('DB reloaded')
 
         if self.latestRunId is not None:
             idxs = self.dbdf.index.values
@@ -539,7 +540,7 @@ class QCodesDBInspector(QtWidgets.QMainWindow):
 
     @Slot()
     def monitorTriggered(self) -> None:
-        logger().debug('Refreshing DB')
+        LOGGER.debug('Refreshing DB')
         self.refreshDB()
 
     @Slot()
@@ -549,7 +550,10 @@ class QCodesDBInspector(QtWidgets.QMainWindow):
         selection = self.dbdf.loc[self.dbdf['started_date'].isin(self._selected_dates)].sort_index(ascending=False)
         show_only_star = self.showOnlyStarAction.isChecked()
         show_also_cross = self.showAlsoCrossAction.isChecked()
-        self.runList.setRuns(selection.to_dict(orient='index'), show_only_star, show_also_cross)
+        # Pandas types cannot infer that this dataframe will be
+        # using int as index and Dict[str, str] as keys
+        selection_dict = cast(Dict[int, Dict[str,str]], selection.to_dict(orient='index'))
+        self.runList.setRuns(selection_dict, show_only_star, show_also_cross)
 
     ### handling user selections
     @Slot(list)
@@ -558,12 +562,15 @@ class QCodesDBInspector(QtWidgets.QMainWindow):
             assert self.dbdf is not None
             selection = self.dbdf.loc[self.dbdf['started_date'].isin(dates)].sort_index(ascending=False)
             old_dates = self._selected_dates
+            # Pandas types cannot infer that this dataframe will be
+            # using int as index and Dict[str, str] as keys
+            selection_dict = cast(Dict[int, Dict[str,str]], selection.to_dict(orient='index'))
             if not all(date in old_dates for date in dates):
                 show_only_star = self.showOnlyStarAction.isChecked()
                 show_also_cross = self.showAlsoCrossAction.isChecked()
-                self.runList.setRuns(selection.to_dict(orient='index'), show_only_star, show_also_cross)
+                self.runList.setRuns(selection_dict, show_only_star, show_also_cross)
             else:
-                self.runList.updateRuns(selection.to_dict(orient='index'))
+                self.runList.updateRuns(selection_dict)
             self._selected_dates = tuple(dates)
         else:
             self._selected_dates = ()
@@ -642,9 +649,9 @@ def inspectr(dbPath: Optional[str] = None) -> QCodesDBInspector:
     return win
 
 
-def main(dbPath: Optional[str]) -> None:
+def main(dbPath: Optional[str], log_level: Union[int, str] = logging.WARNING) -> None:
     app = QtWidgets.QApplication([])
-    plottrlog.enableStreamHandler(True)
+    plottrlog.enableStreamHandler(True, log_level)
 
     win = inspectr(dbPath=dbPath)
     win.show()
@@ -659,5 +666,8 @@ def script() -> None:
     parser = argparse.ArgumentParser(description='inspectr -- sifting through qcodes data.')
     parser.add_argument('--dbpath', help='path to qcodes .db file',
                         default=None)
+    parser.add_argument("--console-log-level",
+                        choices=("ERROR", "WARNING", "INFO", "DEBUG"),
+                        default="WARNING")
     args = parser.parse_args()
-    main(args.dbpath)
+    main(args.dbpath, args.console_log_level)

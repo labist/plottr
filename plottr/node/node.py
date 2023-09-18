@@ -5,9 +5,10 @@ Contains the base class for Nodes.
 """
 import traceback
 from logging import Logger
+import warnings
 
 from functools import wraps
-from typing import Any, Union, Tuple, Dict, Optional, Type, List, Callable, TypeVar
+from typing import Any, Union, Tuple, Dict, Optional, Type, List, Callable, TypeVar, Generic
 
 from .. import NodeBase
 from .. import QtGui, QtCore, Signal, Slot, QtWidgets
@@ -100,10 +101,11 @@ def emitGuiUpdate(signalName: str) -> Callable[[Callable[..., Any]], Callable[..
 
     return decorator
 
+NodeWidgetType = TypeVar("NodeWidgetType", bound="NodeWidget")
 
 # TODO: should we add a list of options to the class?
 #   that would allow programmatic syncing from node to widget, for instance.
-class Node(NodeBase):
+class Node(NodeBase, Generic[NodeWidgetType]):
     """Base class of the Node we use for plotter.
 
     This class inherits from ``pyqtgraph``'s Node, and adds a few additional
@@ -121,7 +123,7 @@ class Node(NodeBase):
 
     #: UI node widget class. If not None, and ``useUi`` is ``True``, an
     #: instance of the widget is created, and signal/slots are connected.
-    uiClass: Optional[Type["NodeWidget"]] = None
+    uiClass: Optional[Type[NodeWidgetType]] = None
 
     #: Whether or not to automatically set up a UI widget.
     useUi = True
@@ -176,10 +178,12 @@ class Node(NodeBase):
         self.dataStructure: Optional[DataDictBase] = None
 
         if self.useUi and self.__class__.uiClass is not None:
-            self.ui: Optional["NodeWidget"] = self.__class__.uiClass(node=self)
+            self.ui: Optional["NodeWidgetType"] = self.__class__.uiClass(node=self)
             self.setupUi()
         else:
             self.ui = None
+
+        self.node_logger = self._logger()
 
     def setupUi(self) -> None:
         """ setting up the UI widget.
@@ -229,17 +233,20 @@ class Node(NodeBase):
             err = f'EXCEPTION RAISED: {e[0]}: {e[1]}\n'
             for t in traceback.format_tb(e[2]):
                 err += f' -> {t}\n'
-            self.logger().error(err)
+            self.node_logger.error(err)
 
-    def logger(self) -> Logger:
+    def _logger(self) -> Logger:
         """Get a logger for this node
 
         :return: logger with a name that can be traced back easily to this node.
         """
         name = f"{self.__module__}.{self.__class__.__name__}.{self.name()}"
         logger = log.getLogger(name)
-        logger.setLevel(log.LEVEL)
         return logger
+
+    def logger(self) -> Logger:
+        warnings.warn("Calling logger on a node is deprecated. Use `node.node_logger` instead.")
+        return self._logger()
 
     def validateOptions(self, data: DataDictBase) -> bool:
         """Validate the user options
@@ -254,6 +261,7 @@ class Node(NodeBase):
     # TODO: should think about nodes with multiple inputs -- how would this look then?
     # FIXME: return should only be Optional[Dict[str, DataDictBase]]
     def process(self, dataIn: Optional[DataDictBase]=None) -> Optional[Dict[str, Optional[DataDictBase]]]:
+        self.node_logger.debug(f"Processing data with node: {self.nodeName}")
         if dataIn is None:
             return None
 
@@ -326,13 +334,14 @@ class Node(NodeBase):
             self.dataShapesChanged.emit(dshapes)
 
         if not self.validateOptions(dataIn):
-            self.logger().debug("Option validation not passed")
+            self.node_logger.debug("Option validation not passed")
             return None
 
         return dict(dataOut=dataIn)
 
+EmbedWidgetType = TypeVar("EmbedWidgetType", bound=QtWidgets.QWidget)
 
-class NodeWidget(QtWidgets.QWidget):
+class NodeWidget(QtWidgets.QWidget, Generic[EmbedWidgetType]):
     """
     Base class for Node control widgets.
 
@@ -355,7 +364,7 @@ class NodeWidget(QtWidgets.QWidget):
     allOptionsToNode = Signal(object)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None,
-                 embedWidgetClass: Optional[Type[QtWidgets.QWidget]] = None,
+                 embedWidgetClass: Optional[Type[EmbedWidgetType]] = None,
                  node: Optional[Node] = None):
         super().__init__(parent)
 
@@ -365,7 +374,7 @@ class NodeWidget(QtWidgets.QWidget):
 
         self._emitGuiChange = True
 
-        self.widget: Optional[QtWidgets.QWidget] = None
+        self.widget: Optional[EmbedWidgetType] = None
 
         if embedWidgetClass is not None:
             layout = QtWidgets.QVBoxLayout()

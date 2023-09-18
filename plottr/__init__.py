@@ -4,6 +4,7 @@ from importlib.util import spec_from_file_location, module_from_spec
 import logging
 import os
 import sys
+import signal
 
 if TYPE_CHECKING:
     from PyQt5 import QtCore, QtGui, QtWidgets
@@ -18,15 +19,27 @@ from pyqtgraph.flowchart import Flowchart as pgFlowchart, Node as pgNode
 Flowchart = pgFlowchart
 NodeBase = pgNode
 
-from ._version import get_versions
-__version__ = get_versions()['version']
-del get_versions
+from ._version import __version__
 
 logger = logging.getLogger(__name__)
 logger.info(f"Imported plottr version: {__version__}")
 
 
 plottrPath = os.path.split(os.path.abspath(__file__))[0]
+
+
+def qtsleep(delay_sec: float) -> None:
+    """sleep function that allows QT event processing in the background."""
+    loop = QtCore.QEventLoop()
+    QtCore.QTimer.singleShot(int(delay_sec * 1000), loop.quit)
+    loop.exec_()
+
+
+def qtapp() -> QtWidgets.QApplication:
+    """make a QT application that can be interrupted by Ctrl+C in the terminal."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    app = QtWidgets.QApplication(sys.argv)
+    return app
 
 
 def configPaths() -> Tuple[str, str, str]:
