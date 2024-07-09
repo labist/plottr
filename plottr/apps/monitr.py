@@ -22,17 +22,20 @@ from typing import List, Optional, Dict, Any, Union, Generator, Iterable, Tuple,
 from functools import partial
 from itertools import cycle
 
-from watchdog.events import FileSystemEvent  # type: ignore[import] # Open PR for mypy in watchdog: https://github.com/gorakhargosh/watchdog/pull/908
+from watchdog.events import FileSystemEvent, FileSystemMovedEvent
 
 from .. import log as plottrlog
 from .. import QtCore, QtWidgets, Signal, Slot, QtGui, plottrPath
+from .. import config_entry as getcfg
+from ..plot.mpl.autoplot import AutoPlot as MPLAutoPlot
+from ..plot.pyqtgraph.autoplot import AutoPlot as PGAutoPlot
 from ..data.datadict_storage import all_datadicts_from_hdf5, datadict_from_hdf5
 from ..data.datadict import DataDict
 from ..utils.misc import unwrap_optional
 from ..apps.watchdog_classes import WatcherClient
 from ..gui.widgets import Collapsible
 from .json_viewer import JsonModel, JsonTreeView
-from ..icons import get_starIcon as get_star_icon, get_trashIcon as get_trash_icon
+from ..icons import get_starIcon as get_star_icon, get_trashIcon as get_trash_icon, get_completeIcon as get_complete_icon, get_interruptedIcon as get_interrupted_icon, get_imageIcon as get_img_icon, get_jsonIcon as get_json_icon, get_mdIcon as get_md_icon
 from .appmanager import AppManager
 
 TIMESTRFORMAT = "%Y-%m-%dT%H%M%S"
@@ -83,6 +86,7 @@ class ContentType(Enum):
     tag = auto()
     json = auto()
     md = auto()
+    py = auto()
     image = auto()
     unknown = auto()
 
@@ -105,6 +109,8 @@ class ContentType(Enum):
             return ContentType.json
         elif extension == 'md':
             return ContentType.md
+        elif extension == 'py':
+            return ContentType.py
         elif extension == 'jpg' or extension == 'jpeg' or extension == 'png' or extension == 'image':
             return ContentType.image
         else:
@@ -127,7 +133,7 @@ class ContentType(Enum):
 
 class SupportedDataTypes:
 
-    valid_types = ['.ddh5', '.md', '.json']
+    valid_types = ['.ddh5', '.md', '.json', '.py']
 
     @classmethod
     def check_valid_data(cls, file_names: Sequence[Union[str, Path]]) -> bool:
@@ -166,11 +172,14 @@ class Item(QtGui.QStandardItem):
         self.tags_widget = ItemTagLabel(self.tags)
         self.star = False
         self.trash = False
+        self.complete = False
+        self.interrupted = False
         self.scroll_height = 0
         self.show = True
         if files is not None:
             self.files.update(files)
             self.tags = [file.stem for file, file_type in self.files.items() if file_type == ContentType.tag]
+
             if '__star__' in self.tags and '__trash__' in self.tags:
                 star_path = self.path.joinpath('__star__.tag')
                 trash_path = self.path.joinpath('__trash__.tag')
@@ -187,6 +196,24 @@ class Item(QtGui.QStandardItem):
             elif '__trash__' in self.tags:
                 self.trash = True
                 self.tags.remove('__trash__')
+
+            if '__complete__' in self.tags and '__interrupted__' in self.tags:
+                complete_path = self.path.joinpath('__complete__.tag')
+                interrupted_path = self.path.joinpath('__interrupted__.tag')
+                if complete_path.is_file() and interrupted_path.is_file():
+                    LOGGER.error(
+                        f'The folder: {self.path} contains both the complete and interrupted tag. Both tags will be deleted.')
+                    complete_path.unlink()
+                    interrupted_path.unlink()
+                    self.tags.remove('__complete__')
+                    self.tags.remove('__interrupted__')
+            elif '__complete__' in self.tags:
+                self.complete = True
+                self.tags.remove('__complete__')
+            elif '__interrupted__' in self.tags:
+                self.interrupted = True
+                self.tags.remove('__interrupted__')
+
             self.tags_widget = ItemTagLabel(self.tags)
 
         self.setText(str(self.path.name))
@@ -213,7 +240,7 @@ class Item(QtGui.QStandardItem):
                     error_msg = QtWidgets.QMessageBox()
                     error_msg.setText(f'Folder is already trash. Please do not add both __trash__ and __star__ tags in the same folder. '
                                       f' \n {path} was deleted ')
-                    error_msg.setWindowTitle(f'Deleting __trash__.tag')
+                    error_msg.setWindowTitle(f'Deleting __star__.tag')
                     error_msg.exec_()
                     return
                 else:
@@ -228,11 +255,42 @@ class Item(QtGui.QStandardItem):
                     error_msg.setText(
                         f'Folder is already star. Please do not add both __trash__ and __star__ tags in the same folder. '
                         f' \n {path} was deleted ')
-                    error_msg.setWindowTitle(f'Deleting __star__.tag')
+                    error_msg.setWindowTitle(f'Deleting __trash__.tag')
                     error_msg.exec_()
                     return
                 else:
                     self.trash = True
+
+            elif path.name == '__complete__.tag':
+                # Check if the item is already tagged as interrupted.
+                interrupted_path = path.parent.joinpath('__interrupted__.tag')
+                if interrupted_path.is_file():
+                    path.unlink()
+                    error_msg = QtWidgets.QMessageBox()
+                    error_msg.setText(
+                        f'Folder is already tagged as interrupted. Please do not add both __complete__ and __interrupted__ tags in the same folder.\n'
+                        f'{path} was deleted.')
+                    error_msg.setWindowTitle(f'Deleting __complete__.tag')
+                    error_msg.exec_()
+                    return
+                else:
+                    self.complete = True
+
+            elif path.name == '__interrupted__.tag':
+                # Check if the item is already tagged as complete.
+                complete_path = path.parent.joinpath('__complete__.tag')
+                if complete_path.is_file():
+                    path.unlink()
+                    error_msg = QtWidgets.QMessageBox()
+                    error_msg.setText(
+                        f'Folder is already tagged as complete. Please do not add both __complete__ and __interrupted__ tags in the same folder.\n'
+                        f'{path} was deleted.')
+                    error_msg.setWindowTitle(f'Deleting __interrupted__.tag')
+                    error_msg.exec_()
+                    return
+                else:
+                    self.interrupted = True
+
             else:
                 self.tags.append(path.stem)
                 self.tags_widget.add_tag(path.stem)
@@ -262,6 +320,10 @@ class Item(QtGui.QStandardItem):
                 self.star = False
             elif path.name == '__trash__.tag':
                 self.trash = False
+            elif path.name == '__complete__.tag':
+                self.complete = False
+            elif path.name == '__interrupted__.tag':
+                self.interrupted = False
 
             model.item_files_changed(self)
 
@@ -494,6 +556,10 @@ class FileModel(QtGui.QStandardItemModel):
             item.setIcon(get_star_icon())
         elif item.trash:
             item.setIcon(get_trash_icon())
+        elif item.complete:
+            item.setIcon(get_complete_icon())
+        elif item.interrupted:
+            item.setIcon(get_interrupted_icon())
         else:
             item.setIcon(QtGui.QIcon())
 
@@ -619,7 +685,7 @@ class FileModel(QtGui.QStandardItemModel):
                 del self.main_dictionary[child_item.path]
 
     @Slot(FileSystemEvent)
-    def on_file_moved(self, event: FileSystemEvent) -> None:
+    def on_file_moved(self, event: FileSystemMovedEvent) -> None:
         """
         Gets triggered every time a file is moved or the name of a file (including type) changes.
         """
@@ -889,6 +955,10 @@ class FileModel(QtGui.QStandardItemModel):
             item.setIcon(get_star_icon())
         elif item.trash:
             item.setIcon(get_trash_icon())
+        elif item.complete:
+            item.setIcon(get_complete_icon())
+        elif item.interrupted:
+            item.setIcon(get_interrupted_icon())
         else:
             item.setIcon(QtGui.QIcon())
 
@@ -1045,6 +1115,11 @@ class FileTreeView(QtWidgets.QTreeView):
     #:  - The index of the currently selected item.
     item_deleted = Signal(QtCore.QModelIndex)
 
+    # Signal(Path) -- Emitted when the copy path action has been clicked.
+    #: Arguments:
+    #:  - The index of the currently selected item.
+    item_path_copied = Signal(QtCore.QModelIndex)
+
     def __init__(self, proxy_model: SortFilterProxyModel, parent: Optional[Any] = None):
         """
         The TreeView used in the FileExplorer widget.
@@ -1062,6 +1137,7 @@ class FileTreeView(QtWidgets.QTreeView):
         self.un_trash_text = 'un-trash'
 
         self.context_menu = QtWidgets.QMenu(self)
+        self.copy_path_action = QtWidgets.QAction('copy path')
         self.star_action = QtWidgets.QAction('star')
         self.trash_action = QtWidgets.QAction('trash')
         self.delete_action = QtWidgets.QAction('delete')
@@ -1152,7 +1228,7 @@ class FileTreeView(QtWidgets.QTreeView):
             return
 
         assert isinstance(item, Item)
-        # Sets the correct the correct text for the context menu depending on the state of the item.
+        # Sets the correct text for the context menu depending on the state of the item.
         if item.star:
             self.star_action.setText(self.un_star_text)
         else:
@@ -1162,6 +1238,8 @@ class FileTreeView(QtWidgets.QTreeView):
         else:
             self.trash_action.setText(self.trash_text)
 
+        self.context_menu.addAction(self.copy_path_action)
+        self.context_menu.addSeparator()
         self.context_menu.addAction(self.star_action)
         self.context_menu.addAction(self.trash_action)
         self.context_menu.addSeparator()
@@ -1207,6 +1285,13 @@ class FileTreeView(QtWidgets.QTreeView):
 
         item_proxy_index = self.currentIndex()
         item_index = self.proxy_model.mapToSource(item_proxy_index)
+
+        # If the action is copy the path, we just want to emit the correct signal and not do anything else.
+        # The model does not need to know about it.
+        if action == self.copy_path_action:
+            self.item_path_copied.emit(item_index)
+            return
+
         self.model_.tag_action_triggered(item_index, tag)
 
     def currentChanged(self, current: QtCore.QModelIndex, previous: QtCore.QModelIndex) -> None:
@@ -1666,6 +1751,10 @@ class FileExplorer(QtWidgets.QWidget):
                  *args: Any, **kwargs: Any):
         super().__init__(parent=parent, *args, **kwargs)  # type: ignore[misc] # I suspect this error comes from having parent possibly be a kwarg too.
 
+        # Holds all the current .ddh5 file paths that are currently being displayed.
+        # Used to set the tooltip in the copy button
+        self.path_list: Union[List[str], str] = []
+
         # Tree and model initialization
         self.proxy_model = proxy_model
         self.model = proxy_model.sourceModel()
@@ -1685,6 +1774,7 @@ class FileExplorer(QtWidgets.QWidget):
         self.refresh_button = QtWidgets.QPushButton('Refresh')
         self.expand_button = QtWidgets.QPushButton('Expand')
         self.collapse_button = QtWidgets.QPushButton('Collapse')
+        self.copy_button = QtWidgets.QPushButton('Copy Path')
         self.tag_filter_combobox = QtWidgets.QComboBox()
         self.tag_filter_combobox.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
         self.tag_filter_combobox.setModel(self.model.tags_model)
@@ -1705,6 +1795,7 @@ class FileExplorer(QtWidgets.QWidget):
         self.filter_and_buttons_layout.addWidget(self.trash_button)
         self.filter_and_buttons_layout.addWidget(self.tag_filter_combobox)
         self.bottom_buttons_layout.addWidget(self.refresh_button)
+        self.bottom_buttons_layout.addWidget(self.copy_button)
         self.bottom_buttons_layout.addWidget(self.expand_button)
         self.bottom_buttons_layout.addWidget(self.collapse_button)
         self.main_layout.addLayout(self.filter_and_buttons_layout)
@@ -1715,6 +1806,7 @@ class FileExplorer(QtWidgets.QWidget):
         self.trash_button.clicked.connect(self.on_star_trash_refresh_clicked)
         self.expand_button.clicked.connect(self.file_tree.expandAll)
         self.collapse_button.clicked.connect(self.file_tree.collapseAll)
+        self.copy_button.clicked.connect(self.on_copy_button_clicked)
 
         self.filter_line_edit.textChanged.connect(self.on_filter_triggered)
         self.model.selected_tags_changed.connect(self.on_selected_tag_changed)
@@ -1724,6 +1816,9 @@ class FileExplorer(QtWidgets.QWidget):
 
         # When the refresh button of the file explorer is pressed, refresh the model
         self.refresh_button.clicked.connect(self.model.refresh_model)
+
+        self.file_tree.item_path_copied.connect(self.on_create_path_list)
+        self.on_create_path_list()
 
     @Slot(list)
     def on_selected_tag_changed(self, tags_filter: List[str]) -> None:
@@ -1791,6 +1886,8 @@ class FileExplorer(QtWidgets.QWidget):
         items_list = [item for item in results_dict.values()]
         self.proxy_model.filter_requested(list(items_list), self.star_button.isChecked(), self.trash_button.isChecked())
 
+        self.on_create_path_list()
+
     @Slot(Item)
     def on_new_item_created(self, item: Item) -> None:
         """
@@ -1845,6 +1942,44 @@ class FileExplorer(QtWidgets.QWidget):
             if item in self.proxy_model.allowed_items:
                 self.proxy_model.allowed_items.remove(item)
                 self.proxy_model.trigger_filter()
+
+    def on_create_path_list(self, item_index: Optional[QtCore.QModelIndex] = None) -> None:
+        """
+        Creates the path list for the copy button. The path list is a list of all the paths of the data files of the
+        allowed items. If no item_index is passed, it will copy all the items that are currently shown by the view.
+        If an item_index is passed, it will copy only the data files of that selected item
+
+        :param item_index: the index of the item whose data files paths we want to copy.
+        """
+        self.path_list = []
+        if item_index is None:
+            for item in self.proxy_model.allowed_items:
+                assert isinstance(item, Item)
+                for path, tpe in item.files.items():
+                    if tpe == ContentType.data:
+                        self.path_list.append(str(path))
+        else:
+            item = self.model.itemFromIndex(item_index)  # type: ignore[attr-defined] # Not sure why mypy is complaining about using itemFromIndex only here but not in other places.
+            assert isinstance(item, Item)
+            for path, tpe in item.files.items():
+                if tpe == ContentType.data:
+                    self.path_list.append(str(path))
+
+        if len(self.path_list) > 10:
+            self.copy_button.setToolTip('Copy the paths of the data files for the currently filtered items.')
+        else:
+            if len(self.path_list) == 1:
+                self.path_list = "'" + str(self.path_list[0]) + "'"
+            self.copy_button.setToolTip('Copy the following paths to clipboard:\n' + str(self.path_list))
+
+    @Slot()
+    def on_copy_button_clicked(self) -> None:
+        """
+        Gets called when the copy button is clicked. Copies the contents of self.path_list to the clipboard.
+        """
+        clipboard = QtWidgets.QApplication.clipboard()
+        clipboard.setText(str(self.path_list))
+
 
 class DataTreeWidgetItem(QtWidgets.QTreeWidgetItem):
     """
@@ -2057,20 +2192,14 @@ class FloatingButtonWidget(QtWidgets.QPushButton):
             self.setText(self.edit_text)
 
 
-class TextEditWidget(QtWidgets.QTextEdit):
+class TextViewWidget(QtWidgets.QTextEdit):
     """
-    Widget that displays md files that are in the same folder as a ddh5 file.
-
-    It contains a floating button that allows for editing and saving changes done in the editing phase. Text is not
-    editable before clicking the button.
+    Widget that displays a text-based file such as .md or .py in the same folder as a ddh5 file.
     """
 
     def __init__(self, path: Path, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.path = path
-
-        self.floating_button = FloatingButtonWidget(parent=self)
-        self.floating_button.hide()
 
         size_policy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Minimum)
         self.setSizePolicy(size_policy)
@@ -2085,22 +2214,12 @@ class TextEditWidget(QtWidgets.QTextEdit):
         self.setPlainText(self.file_text)
         document = QtGui.QTextDocument(self.file_text, parent=self)
         self.setDocument(document)
-        self.text_before_edit = self.toPlainText()
-        self.floating_button.save_activated.connect(self.save_activated)
-        self.floating_button.edit_activated.connect(self.edit_activated)
         self.document().contentsChanged.connect(self.size_change)
 
         # Arbitrary threshold height.
         self.max_threshold_height = 211
         self.min_threshold_height = 2
         self.size_change()
-
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        """
-        Called every time the size of the widget changes. Triggers the change in position of the floating button.
-        """
-        super().resizeEvent(event)
-        self.floating_button.update_position()
 
     def size_change(self) -> None:
         """
@@ -2122,6 +2241,29 @@ class TextEditWidget(QtWidgets.QTextEdit):
             height = round(self.document().size().height())
 
         return QtCore.QSize(width, height)
+
+
+class TextEditWidget(TextViewWidget):
+    """
+    Widget that displays md files that are in the same folder as a ddh5 file.
+
+    It contains a floating button that allows for editing and saving changes done in the editing phase. Text is not
+    editable before clicking the button.
+    """
+
+    def __init__(self, path: Path, *args: Any, **kwargs: Any):
+        super().__init__(path, *args, **kwargs)
+        self.floating_button = FloatingButtonWidget(parent=self)
+        self.floating_button.hide()
+        self.floating_button.save_activated.connect(self.save_activated)
+        self.floating_button.edit_activated.connect(self.edit_activated)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        """
+        Called every time the size of the widget changes. Triggers the change in position of the floating button.
+        """
+        super().resizeEvent(event)
+        self.floating_button.update_position()
 
     def enterEvent(self, *args: Any, **kwargs: Any) -> None:
         super().enterEvent(*args, **kwargs)
@@ -2328,8 +2470,27 @@ class ImageViewer(QtWidgets.QLabel):
             self.setText(f'Image could not be displayed')
             LOGGER.error(e)
 
+        self.context_menu = QtWidgets.QMenu(self)
+
+        # creating actions
+        self.copy_action = QtWidgets.QAction('copy')
+        self.copy_action.triggered.connect(self.on_copy_action)
+
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.on_context_menu_requested)
+        self.context_menu.addAction(self.copy_action)
+
         self.installEventFilter(self)
         self.setMinimumWidth(1)
+
+    @Slot(QtCore.QPoint)
+    def on_context_menu_requested(self, pos: QtCore.QPoint) -> None:
+        self.context_menu.exec_(self.mapToGlobal(pos))
+
+    @Slot()
+    def on_copy_action(self) -> None:
+        clipboard = QtWidgets.QApplication.clipboard()
+        clipboard.setImage(self.image)
 
     # FIXME: Instead of detecting when the infinite loop starts occurring and stopping it, figure out exactly what starts
     #   it and prevent it all together.
@@ -2694,7 +2855,7 @@ class LoaderWorker(QtCore.QObject):
             if not only_data_files:
                 if file_type == ContentType.tag:
                     data_in['tag_labels'].append(prefix_text + str(file.stem))
-                elif file_type == ContentType.json or file_type == ContentType.md or file_type == ContentType.image:
+                elif file_type in [ContentType.json, ContentType.md, ContentType.py, ContentType.image]:
                     # Check if the files exist.
                     if file.is_file():
                         data_in['extra_files'].append((file, prefix_text + str(file.name), file_type))
@@ -2757,6 +2918,17 @@ class Monitr(QtWidgets.QMainWindow):
         # Setting up main window
         self.main_partition_splitter = QtWidgets.QSplitter()
         self.setCentralWidget(self.main_partition_splitter)
+
+        # Create menu bar
+        menu_bar = self.menuBar()
+        menu = menu_bar.addMenu("Backend")
+        self.backend_group = QtWidgets.QActionGroup(menu)
+        for backend, plotWidgetClass in [("matplotlib", MPLAutoPlot), ("pyqtgraph", PGAutoPlot)]:
+            action = QtWidgets.QAction(backend)
+            action.setCheckable(True)
+            action.setChecked(getcfg('main', 'default-plotwidget') == plotWidgetClass)
+            self.backend_group.addAction(action)
+            menu.addAction(action)
 
         # Set left side layout
         self.left_side_layout = QtWidgets.QVBoxLayout()
@@ -3109,7 +3281,11 @@ class Monitr(QtWidgets.QMainWindow):
         :param path: The path of the ddh5 file that should be displayed.
         :return:
         """
-        self.app_manager.launchApp(self.current_app_id, AUTOPLOTMODULE, AUTOPLOTFUNC, str(path), 'data')
+        if self.backend_group.checkedAction() is None:
+            backend = "default"
+        else:
+            backend = self.backend_group.checkedAction().text()
+        self.app_manager.launchApp(self.current_app_id, AUTOPLOTMODULE, AUTOPLOTFUNC, str(path), 'data', backend)
         self.current_app_id += 1
 
     def add_text_input(self, path: Path) -> None:
@@ -3134,7 +3310,8 @@ class Monitr(QtWidgets.QMainWindow):
                 expand = False
                 if file in self.collapsed_state_dictionary:
                     expand = self.collapsed_state_dictionary[file]
-                json_view = Collapsible(widget=JsonTreeView(path=file), title=name, expanding=expand)
+                json_view = Collapsible(widget=JsonTreeView(path=file), title=name, expanding=expand,
+                                        icon=get_json_icon())
                 json_view.widget.setVisible(expand)
                 json_view.btn.setChecked(expand)
                 if expand:
@@ -3160,7 +3337,24 @@ class Monitr(QtWidgets.QMainWindow):
                 if file in self.collapsed_state_dictionary:
                     expand = self.collapsed_state_dictionary[file]
                 plain_text_edit = Collapsible(widget=TextEditWidget(path=file),
-                                              title=name, expanding=expand)
+                                              title=name, expanding=expand, icon=get_md_icon())
+
+                plain_text_edit.widget.setVisible(expand)
+                plain_text_edit.btn.setChecked(expand)
+                if expand:
+                    plain_text_edit.btn.setText(plain_text_edit.expandedTitle)
+                else:
+                    plain_text_edit.btn.setText(plain_text_edit.collapsedTitle)
+
+                self.file_windows.append(plain_text_edit)
+                self.right_side_layout.addWidget(plain_text_edit)
+
+            elif file_type == ContentType.py:
+                expand = True
+                if file in self.collapsed_state_dictionary:
+                    expand = self.collapsed_state_dictionary[file]
+                plain_text_edit = Collapsible(widget=TextViewWidget(path=file),
+                                              title=name, expanding=expand, icon=get_md_icon())
 
                 plain_text_edit.widget.setVisible(expand)
                 plain_text_edit.btn.setChecked(expand)
@@ -3177,7 +3371,7 @@ class Monitr(QtWidgets.QMainWindow):
                 if file in self.collapsed_state_dictionary:
                     expand = self.collapsed_state_dictionary[file]
                 label = Collapsible(ImageViewer(file, parent=self.right_side_dummy_widget),
-                                    title=name, expanding=expand)
+                                    title=name, expanding=expand, icon=get_img_icon())
                 label.widget.setVisible(expand)
                 label.btn.setChecked(expand)
                 if expand:
